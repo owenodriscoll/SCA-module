@@ -65,13 +65,31 @@ class GMF_SWB:
         else:
             inverse_wave_age_ = xr.DataArray(inverse_wave_age.ravel(), dims='points')
 
+        # Check bounds for all coordinates
+        v_min, v_max = float(data['wind_norm'].min()), float(data['wind_norm'].max())
+        phi_min, phi_max = float(data['wind_direction'].min()), float(data['wind_direction'].max())
+        theta_min, theta_max = float(data['incidence'].min()), float(data['incidence'].max())
+        wa_min, wa_max = float(data['wave_age'].min()), float(data['wave_age'].max())
+
+        # Create validity mask
+        valid = (
+            (wind_norm_ >= v_min) & (wind_norm_ <= v_max) &
+            (wind_direction_ >= phi_min) & (wind_direction_ <= phi_max) &
+            (incidence_ >= theta_min) & (incidence_ <= theta_max) &
+            (inverse_wave_age_ >= wa_min) & (inverse_wave_age_ <= wa_max)
+        )
+
         result = data.sel(
             wind_norm=wind_norm_, 
             wind_direction=wind_direction_, 
             incidence=incidence_, 
             wave_age=inverse_wave_age_,
-            method='nearest'
+            method='nearest',
         ).values.reshape(*v.shape)
+
+        # Set out-of-bounds values to NaN
+        result = result.astype(float)
+        result[~valid.values.reshape(*v.shape)] = np.nan
 
         return result
 
@@ -89,11 +107,23 @@ class GMF_SWB:
         else:
             inverse_wave_age_ = xr.DataArray(inverse_wave_age.ravel(), dims='points')
 
+        # Check bounds for coordinate dimensions (excluding wind_norm which is the LUT dimension being searched)
+        phi_min, phi_max = float(data['wind_direction'].min()), float(data['wind_direction'].max())
+        theta_min, theta_max = float(data['incidence'].min()), float(data['incidence'].max())
+        wa_min, wa_max = float(data['wave_age'].min()), float(data['wave_age'].max())
+
+        # Create validity mask
+        valid = (
+            (wind_direction_ >= phi_min) & (wind_direction_ <= phi_max) &
+            (incidence_ >= theta_min) & (incidence_ <= theta_max) &
+            (inverse_wave_age_ >= wa_min) & (inverse_wave_age_ <= wa_max)
+        )
+
         subset = data.sel(
             wind_direction=wind_direction_, 
             incidence=incidence_, 
             wave_age=inverse_wave_age_,
-            method='nearest'
+            method='nearest',
         )
 
         # -- compute differences to find minimum index
@@ -102,8 +132,13 @@ class GMF_SWB:
 
         # -- extract corresponding wind_norm values
         most_likely_wind_norms = subset["wind_norm"].isel(wind_norm=min_idx)
+        result = most_likely_wind_norms.data.reshape(*y.shape)
 
-        return most_likely_wind_norms.data.reshape(*y.shape)
+        # Set out-of-bounds values to NaN
+        result = result.astype(float)
+        result[~valid.values.reshape(*y.shape)] = np.nan
+
+        return result
     
 
     def nrcs_forward(self, v, phi, theta, inverse_wave_age=1):
