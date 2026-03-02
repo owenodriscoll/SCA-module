@@ -417,6 +417,7 @@ def compute_lpf_cube(
         resolution_product,
         data_2_lpf,
         window = 'hann',
+        crop_edges = False,
     ):
 
     data_lpf = [name + "_lpf" for name in data_2_lpf]
@@ -430,5 +431,6 @@ def compute_lpf_cube(
         fs_y=fs_y,
         window=window,
         fill_nans=True,
+        crop_edges=crop_edges,
     )
     return ds
