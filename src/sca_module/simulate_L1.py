@@ -21,6 +21,7 @@ def create_observation_cube(
         dim_filter = "az",
         dim_new = "az_slow_time",
         dim_window = "az_beam",
+        dropna = True
         ):
     """
     Function to remove data outside beam pattern footprint.
@@ -63,7 +64,8 @@ def create_observation_cube(
     data.attrs["stride"] = stride
     data.attrs["window_size"] = window_size
 
-    data = data.dropna(dim = dim_new)
+    if dropna:
+        data = data.dropna(dim = dim_new)
 
     return data
 
