@@ -61,6 +61,6 @@ def create_dataset(nrcs = np.array, dop = np.array, inc = np.array, grg = np.arr
     )
     data["nrcs"] = interpolater(data["nrcs"])
     conditions_post = (data["nrcs"].isnull()) | (data["nrcs"] <= 0)
-    data = data.where(~(conditions_post))
+    data["nrcs"] = data["nrcs"].where(~(conditions_post))
 
     return data
