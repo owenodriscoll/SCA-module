@@ -28,7 +28,7 @@ dependencies = [
   "ipykernel",
   "joblib",
   "cdsapi",
-  "DopSCA_leakage @ git+ssh://git@github.com/owenodriscoll/DopSCA_leakage.git"
+  "dopsca-leakage @ git+https://github.com/owenodriscoll/DopSCA_leakage.git"
 ]
 
 [project.optional-dependencies]
