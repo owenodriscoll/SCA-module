@@ -47,5 +47,6 @@ jobs:
       run: |
         conda activate myenv
         pip install --upgrade pip
+        pip install setuptools<68 wheel<0.42 llvmlite
         git config --global fetch.timeout 480
         pip install .
