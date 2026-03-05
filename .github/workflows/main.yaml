@@ -1,0 +1,51 @@
+name: CI
+on:
+  push:
+    branches:
+      - main
+      - dev
+  pull_request:
+    branches:
+      - main
+    types: 
+      - opened
+      - synchronize
+      - reopened
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash -el {0}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ["macos-latest", "windows-latest", "ubuntu-latest"]
+        python-version: ["3.12"]
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    - name: Set up Miniconda
+      uses: conda-incubator/setup-miniconda@v2
+      with:
+        activate-environment: myenv
+        python-version: ${{ matrix.python-version }}  # Specify the Python version
+        auto-update-conda: true
+        auto-activate-base: false
+        miniconda-version: "latest"
+    - name: Install GDAL from Conda
+      run: |
+        conda activate myenv
+        conda install gdal
+    - name: Install PyPi packages Windows 
+      if: runner.os == 'Windows'
+      run: |
+        conda activate myenv
+        pip install .
+    - name: Install PyPi packages Linux & MacOS 
+      if: runner.os != 'Windows'
+      run: |
+        conda activate myenv
+        pip install --upgrade pip
+        git config --global fetch.timeout 480
+        pip install .
