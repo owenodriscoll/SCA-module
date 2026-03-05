@@ -47,5 +47,6 @@ jobs:
       run: |
         conda activate myenv
         pip install --upgrade pip
+        pip install 'llvmlite>=0.42.0'
         git config --global fetch.timeout 480
         pip install .
