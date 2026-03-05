@@ -1,0 +1,40 @@
+[project]
+name = "sca-module"
+version = "0.1.0"
+authors = [
+  { name="Owen O'D"},
+]
+description = "Python module to assess L1 and L2 DopSCA performance"
+readme = "README.md"
+classifiers = [
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+]
+
+dependencies = [
+  "dask==2024.4.1",
+  "xarray==2024.3.0",
+  "drama",
+  "stereoid==0.4",
+  "xrft==1.0.1",
+  "numpy==1.26.4",
+  "pandas",
+  "scipy",
+  "matplotlib",
+  "pyproj",
+  "bottleneck",
+  "cmcrameri",
+  "ipykernel",
+  "joblib",
+  "cdsapi",
+  "DopSCA_leakage @ git+ssh://git@github.com/owenodriscoll/DopSCA_leakage.git"
+]
+
+[project.optional-dependencies]
+test = ['pytest']
+dev = ['black[jupyter]']
+
+
+[project.urls]
+Homepage = "https://github.com/owenodriscoll/sca-module"
