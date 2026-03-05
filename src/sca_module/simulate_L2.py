@@ -1,6 +1,5 @@
 import numpy as np
 import xarray as xr
-from pathlib import Path
 from dataclasses import dataclass
 
 
