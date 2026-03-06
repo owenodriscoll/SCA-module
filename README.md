@@ -3,7 +3,7 @@
 ## Data preparation
 1. Download SWB data from [data.4tu.nl](https://data.4tu.nl/private_datasets/wbchBwb0jtmStAHf7U5M5B6xjYBeugZoKB-kgiqfxtI). This is needed for wind-field information.
 
-2. Download SWB lookup tbales from [https://harmony.tudelft.nl](https://harmony.tudelft.nl/?page_id=128).
+2. Download SWB lookup tables from [https://harmony.tudelft.nl](https://harmony.tudelft.nl/?page_id=128).
 
 3. Run the notebooks under `notebooks`
 
