@@ -1,5 +1,3 @@
-![Continuous Integration build in GitHub Actions](https://github.com/owenodriscoll/SCA-module/actions/workflows/main.yaml/badge.svg?branch=main)
-
 ## Data preparation
 1. Download SWB data from [data.4tu.nl](https://data.4tu.nl/private_datasets/wbchBwb0jtmStAHf7U5M5B6xjYBeugZoKB-kgiqfxtI). This is needed for wind-field information.
 
