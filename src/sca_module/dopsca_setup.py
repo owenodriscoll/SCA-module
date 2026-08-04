@@ -17,10 +17,10 @@ class DopSCAConfig:
     # -- System Details
     f0: float = 5.405e9  # Carrier frequency [Hz], Hoogeboom et al. (2018)
     z0: float = 823e3    # Satellite altitude [m], 823-848 km, Fois et al. (2015)
-    vx_sat: int = 6800   # Satellite velocity [m/s], Hoogeboom et al. (2018)
+    vx_sat: int = 7500   # Satellite velocity [m/s], Hoogeboom et al. (2018)
     
     # -- Pulse Details
-    PRF: int = 4                    # Pulse Repetition Frequency per antenna, Hoogeboom et al. (2018)
+    PRF: int = 2                    # Pulse Repetition Frequency per antenna, Hoogeboom et al. (2018)
     SNR: float = 1.0                # Signal to noise ratio (~1 on average for Pulse Pair)
     T_pp: float = 1.15e-4           # Pulse-pair separation time [s]
     
@@ -29,7 +29,8 @@ class DopSCAConfig:
     incidence_min: float = 30                       # Minium observation angle to consider
     grg_max: float = 850E3                          # Maximum ground range [m]
     grg_min: float = 550E3                          # Minimum ground range [m] (within range main lobe)
-    grid_spacing_target: int = 340                  # Target grid spacing [m] (vx_sat / PRF / 5)
+    grid_spacing_target: int = 1000                 # Target grid spacing [m] SWB simulations are loaded on a 1 km grid, 
+                                                    #here you can potentially oversample to avoid aliasing in azimuth
     grid_spacing_slant_range_SCA: float = 75        # Slant range resolution [m]
     az_footprint_cutoff: int = 80_000               # Azimuth footprint cutoff [m]
     resolution_product: int = 50_000                # Product resolution [m], Hoogeboom et al. (2018)
@@ -67,14 +68,14 @@ class DopSCAConfig:
         """Calculate range offset to align with scatterometer observation geometry from the starting incidence angle (in radians)."""
         return cls.z0 * np.tan(incidence_min)
     
-    @classmethod
-    def get_grid_spacing_target(cls, magic_divider) -> int:
+    # @classmethod
+    def get_grid_spacing_target(self, magic_divider) -> int:
         """
         Calculate some finer grid spacing which to prevent aliasing due to, for instance, a low PRF. 
         Ideally the new gridspacing should be a multiple of the stallite velocity divided by the PRF, which is the distance between pulse centers.
 
         """
-        new_grid_spacing = cls.vx_sat / cls.PRF / magic_divider
+        new_grid_spacing = self.vx_sat / self.PRF / magic_divider
         if new_grid_spacing != int(new_grid_spacing):
             warnings.warn("New grid spacing is not an integer, which may cause issues with interpolation. Consider adjusting magic_divider to achieve an integer grid spacing.")
         return new_grid_spacing

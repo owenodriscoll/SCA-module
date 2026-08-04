@@ -215,6 +215,8 @@ def add_L1_uncertainties(
     sigma_az_angle = beam_3dB.std(dim=dim_az_beam).mean().values * 1
 
     wavenumber = 2 * np.pi / Lambda
+    # NOTE assumes a single represenative sigma_az_angle over the entire range extent.
+    # When simulating the full range-extent, a range-varying sigma_az_angle would likely be more suitable.
     T_corr_Doppler = 1 / (np.sqrt(2) * wavenumber * vx_sat * sigma_az_angle)  
     T_corr_surface = 3.29 * Lambda / U
 
@@ -296,6 +298,7 @@ def add_L1_uncertainties(
 
         # here we use a different random state again, to avoid some artifical correlation with speckle
         phase_uncertainty = phase_error_generator_2D(gamma_2D.data, theta=0, random_state=random_state + 2, n_bins=1001)
+        # phase_uncertainty = phase_error_generator_2D(gamma_2D.data/gamma_2D.data * 0.75, theta=0, random_state=random_state + 2, n_bins=1001)
 
     else: 
         raise ValueError("fixed_SCR must be either True or False")
