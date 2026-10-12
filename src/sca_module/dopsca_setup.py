@@ -36,7 +36,7 @@ class DopSCAConfig:
     resolution_product: int = 50_000                # Product resolution [m], Hoogeboom et al. (2018)
     product_averaging_window: str = "hann"          # Averaging window type
     
-    # -- Antenna Details
+    # -- Antenna Details                     # NOTE currently not used, as a beam pattern is loaded from EUMETSAT
     beam_pattern: str = "phased_array"       # Beam pattern type: "phased_array" or "sinc"
     antenna_length: float = 2.87             # Antenna length [m], mid beam, Fois et al. (2015)
     antenna_height: float = 0.32             # Antenna height [m], mid beam, Fois et al. (2015)
