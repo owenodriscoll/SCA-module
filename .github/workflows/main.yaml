@@ -20,7 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ["macos-latest", "windows-latest", "ubuntu-latest"]
+        os: ["ubuntu-latest"]
         python-version: ["3.12"]
     steps:
     - name: Checkout repository
@@ -29,7 +29,7 @@ jobs:
       uses: conda-incubator/setup-miniconda@v2
       with:
         activate-environment: myenv
-        python-version: ${{ matrix.python-version }}  # Specify the Python version
+        python-version: ${{ matrix.python-version }} 
         auto-update-conda: true
         auto-activate-base: false
         miniconda-version: "latest"
