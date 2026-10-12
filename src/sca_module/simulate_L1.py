@@ -8,7 +8,7 @@ from leakage.utils import mean_along_azimuth
 from leakage.low_pass_filter import low_pass_filter_2D_dataset
 from leakage.conversions import dB, phase2vel, dop2vel, vel2dop, slant2ground
 from leakage.frequency_domain_padding import padding_fourier, da_integer_oversample_like, compute_padding_1D
-from leakage.uncertainties import pulse_pair_coherence, generate_complex_speckle, speckle_intensity, phase_error_generator, speckle_coherence, phase_error_generator_2D, generate_correlated_complex_speckle
+from leakage.uncertainties import decorrelation, pulse_pair_coherence, generate_complex_speckle, speckle_intensity, phase_error_generator, speckle_coherence, phase_error_generator_2D, generate_correlated_complex_speckle
 
 
 def create_observation_cube(
@@ -213,6 +213,7 @@ def add_L1_uncertainties(
         * data_cube_resamp.az_angle_wrt_boresight # in radians
     )
     sigma_az_angle = beam_3dB.std(dim=dim_az_beam).mean().values * 1
+    # print(sigma_az_angle)
 
     wavenumber = 2 * np.pi / Lambda
     # NOTE assumes a single represenative sigma_az_angle over the entire range extent.
@@ -269,7 +270,14 @@ def add_L1_uncertainties(
     # -------------------------------
     # ---- Pulse-pair uncertaity ----
     # -------------------------------
-        # NOTE assumes no squint
+    # # NOTE assumes no squint
+    # gamma_velocity = decorrelation(
+    # T_pp, T_corr_Doppler
+    # )  # eq 6 & 7 Rodriguez (2018), NOTE not valid for squint NOTE assumes Gaussian beam pattern
+    # gamma_temporal = decorrelation(T_pp, T_corr_surface)
+    # print("gamma D:", gamma_velocity)
+    # print("gamma TW:", gamma_temporal)
+
     if fixed_SCR:
         gamma = pulse_pair_coherence(
             T_pp=T_pp,
@@ -277,6 +285,9 @@ def add_L1_uncertainties(
             T_corr_Doppler=T_corr_Doppler,
             SNR=fixed_SCR
         )
+        # gamma_sncr = (fixed_SCR / (1 + fixed_SCR))
+        # print("gamma SNR:", gamma_sncr)
+        # print("gamma (mean):", gamma)
 
         phase_uncertainty = phase_error_generator(
             gamma=gamma,
@@ -289,17 +300,19 @@ def add_L1_uncertainties(
         temp_independent_slant_range = np.linspace(data_cube_resamp[dim_range].min(), data_cube_resamp[dim_range].max(), da_ones_independent_slant_range.sizes[dim_to_pad_name])
         SNR_2D = (data_cube_resamp.nrcs_scat_speckle_pulse_2 / data_cube_resamp.nrcs_scat_speckle_pulse_1).interp({dim_range:temp_independent_slant_range}, method=interpolator)
 
-        gamma_2D = pulse_pair_coherence(
+        gamma = pulse_pair_coherence(
             T_pp=T_pp,
             T_corr_surface=T_corr_surface,
             T_corr_Doppler=T_corr_Doppler,
             SNR=SNR_2D
         )
+        # gamma_sncr = (SNR_2D / (1 + SNR_2D)).mean().values
+        # print("gamma SNR:", gamma_sncr)
+        # print("gamma (mean):", gamma.mean().values)
 
         # here we use a different random state again, to avoid some artifical correlation with speckle
-        phase_uncertainty = phase_error_generator_2D(gamma_2D.data, theta=0, random_state=random_state + 2, n_bins=1001)
+        phase_uncertainty = phase_error_generator_2D(gamma.data, theta=0, random_state=random_state + 2, n_bins=1001)
         # phase_uncertainty = phase_error_generator_2D(gamma_2D.data/gamma_2D.data * 0.75, theta=0, random_state=random_state + 2, n_bins=1001)
-
     else: 
         raise ValueError("fixed_SCR must be either True or False")
 
@@ -308,7 +321,7 @@ def add_L1_uncertainties(
         wavenumber=wavenumber,
         T=T_pp
     )
-
+    
     da_V_pp = velocity_error * da_ones_independent_slant_range
 
     # replace nans and infs with zero to avoid issues with padding, these will be ignored in the final product as they correspond to areas with no data
