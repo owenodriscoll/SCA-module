@@ -509,3 +509,45 @@ def combine_pulse_pair(
         ds[f"V_sigma_net{suffix}"] = ds[f"V_leakage_pulse_rg_net{suffix}"] + ds[f"V_pp{suffix}"]
 
     return ds
+
+def multilook_nrcs_to_grid(
+        ds,
+        target,
+        var_nrcs = "nrcs_scat_speckle",
+        dim_range = "grg",
+        dim_az_slow_time = "az_slow_time",
+        dim_az = "az",
+    ):
+    """
+    Brings the speckled scatterometer NRCS from its fine range sampling onto the coarser grid of `target`,
+    e.g. to re-estimate leakage from SCA's own NRCS.
+
+    The NRCS is averaged along range over one target grid cell before interpolation, as a ground processor would
+    multi-look it, rather than point-sampling single-look speckle.
+    NOTE no averaging along azimuth, as that would blur the azimuthal NRCS gradients that cause leakage
+
+    Input
+    -----
+    ds: xr.Dataset,
+        dataset containing var_nrcs on a uniform range grid, with dimensions (dim_az_slow_time, dim_range)
+    target: xr.Dataset,
+        dataset providing the target coordinates dim_az and dim_range, e.g. the output of readers.create_dataset
+
+    Returns
+    -------
+    nrcs: xr.DataArray,
+        range-averaged NRCS on the target grid, with dimensions (dim_az, dim_range)
+    """
+    spacing_range = float(ds[dim_range].diff(dim_range).median())
+    spacing_target = float(target[dim_range].diff(dim_range).median())
+    n_avg = max(int(np.round(spacing_target / spacing_range)), 1)
+
+    nrcs = ds[var_nrcs].rolling({dim_range: n_avg}, center=True, min_periods=max(n_avg // 2, 1)).mean()
+    nrcs = nrcs.interp({dim_az_slow_time: target[dim_az].data, dim_range: target[dim_range].data})
+
+    return xr.DataArray(
+        nrcs.transpose(dim_az_slow_time, dim_range).data,
+        dims=(dim_az, dim_range),
+        coords={dim_az: target[dim_az].data, dim_range: target[dim_range].data},
+        name=var_nrcs,
+    )
