@@ -14,8 +14,8 @@ from leakage.uncertainties import decorrelation, pulse_pair_coherence, generate_
 def create_observation_cube(
         ds, 
         az_footprint_cutoff, 
-        grid_spacing, 
-        vx_sat, 
+        grid_spacing,
+        v_sat_ground,
         PRF,
         dim_original = "grg",
         dim_filter = "az",
@@ -26,13 +26,14 @@ def create_observation_cube(
     """
     Function to remove data outside beam pattern footprint.
     Creates a new stack of (potentially overlapping) observations centered on a new azimuthmul coordinate system
+    The along-track spacing of the observations (stride) is v_sat_ground / PRF, with v_sat_ground the ground-track velocity
 
     NOTE does not work for squinted geometries
     """
 
     window_size = np.round(az_footprint_cutoff / grid_spacing).astype("int")
-    stride = vx_sat / PRF
-    stride_elements = np.round(vx_sat / PRF / grid_spacing).astype("int")
+    stride = v_sat_ground / PRF
+    stride_elements = np.round(v_sat_ground / PRF / grid_spacing).astype("int")
 
     data = ds.copy()
 
@@ -118,9 +119,9 @@ def compute_beam_pattern(az_angle_wrt_boresight_slant: np.array, grg_angle_wrt_b
 def add_L1_uncertainties(
         ds: xr.Dataset, 
         dim_range: str, 
-        dim_az_beam: str, 
-        vx_sat: float|int, 
-        U: float|int, 
+        dim_az_beam: str,
+        v_sat_orbit: float|int,
+        U: float|int,
         sat_height: float|int, 
         T_pp: float|int, 
         Lambda: float, 
@@ -149,8 +150,8 @@ def add_L1_uncertainties(
     :type dim_range: str
     :param dim_az_beam: name of the azimuth beam dimension
     :type dim_az_beam: str
-    :param vx_sat: satellite velocity in m/s
-    :type vx_sat: float | int
+    :param v_sat_orbit: satellite velocity used for Doppler in m/s, sets the Doppler decorrelation time
+    :type v_sat_orbit: float | int
     :param U: surface wind speed in m/s used for correlation time computation
     :type U: float | int
     :param sat_height: satellite altitude/height in meters
@@ -226,7 +227,7 @@ def add_L1_uncertainties(
     wavenumber = 2 * np.pi / Lambda
     # NOTE assumes a single represenative sigma_az_angle over the entire range extent.
     # When simulating the full range-extent, a range-varying sigma_az_angle would likely be more suitable.
-    T_corr_Doppler = 1 / (np.sqrt(2) * wavenumber * vx_sat * sigma_az_angle)  
+    T_corr_Doppler = 1 / (np.sqrt(2) * wavenumber * v_sat_orbit * sigma_az_angle)
     T_corr_surface = 3.29 * Lambda / U
 
     # -------------------------------------
@@ -369,7 +370,11 @@ def compute_cube_observation_geometry(ds_cube, dim_az_beam, dim_az_slow_time, di
     
     return data_cube
 
-def compute_true_observations(ds_cube, var_nrcs, var_inc, dim_az_beam, vx_sat, Lambda, var_azimuth_angle_wrt_boresight: str = "az_angle_wrt_boresight_ground"):
+def compute_true_observations(ds_cube, var_nrcs, var_inc, dim_az_beam, v_sat_orbit, Lambda, var_azimuth_angle_wrt_boresight: str = "az_angle_wrt_boresight_ground"):
+    """
+    Integrates NRCS, Doppler and the geometric Doppler (leakage) over the azimuth beam.
+    v_sat_orbit is the satellite velocity used for the geometric Doppler.
+    """
     data_cube = ds_cube.copy()
 
     data_cube["beam_weight"] = data_cube["beam"] / mean_along_azimuth(
@@ -389,7 +394,7 @@ def compute_true_observations(ds_cube, var_nrcs, var_inc, dim_az_beam, vx_sat, L
     )
 
     data_cube["dop_geom"] = vel2dop(
-        velocity=vx_sat,
+        velocity=v_sat_orbit,
         Lambda=Lambda,
         angle_incidence=np.radians(data_cube[var_inc]),  # NOTE assumes flat Earth
         # NOTE vel2dop expects the ground-plane azimuth angle; passing the slant-plane angle applies sin(incidence) twice
