@@ -451,10 +451,16 @@ def compute_lpf_cube(
         data_2_lpf,
         window = 'hann',
         crop_edges = False,
+        min_footprint_coverage = None,
     ):
     """
     Low-pass filters the variables in data_2_lpf to the product resolution, adding them as f"{name}_lpf".
-    Nans are excluded by normalised convolution.
+
+    Nans are excluded by normalised convolution. With min_footprint_coverage, product cells are kept only where at least
+    that fraction of the samples within their footprint is valid. The footprint is the filter's main lobe,
+    +- resolution_product / 2 along both dimensions, and samples beyond the domain count as missing.
+    min_footprint_coverage = 1 keeps only product cells whose whole footprint is available.
+    NOTE fs_x is the sampling along the first dimension of the variables, fs_y along the second
     """
 
     ds = ds_cube.copy()
@@ -479,8 +485,18 @@ def compute_lpf_cube(
         masks.setdefault(mask_of[name], valid)
     weights = low_pass_filter_2D_dataset(xr.Dataset(masks), **kwargs)
 
+    # fraction of valid samples within each cell's footprint, as a separable box average. It is nan where the box leaves the domain
+    complete = {key: True for key in masks}
+    if min_footprint_coverage is not None:
+        half_widths = [int(np.floor(resolution_product / 2 * fs)) for fs in (fs_x, fs_y)]
+        for key, valid in masks.items():
+            coverage = valid
+            for dim, half_width in zip(valid.dims, half_widths):
+                coverage = coverage.rolling({dim: 2 * half_width + 1}, center=True).mean()
+            complete[key] = coverage >= min_footprint_coverage - 1e-6
+
     for name in data_2_lpf:
-        ds[name + "_lpf"] = filtered[name] / weights[mask_of[name]]
+        ds[name + "_lpf"] = (filtered[name] / weights[mask_of[name]]).where(complete[mask_of[name]])
     return ds
 
 def combine_pulse_pair(
