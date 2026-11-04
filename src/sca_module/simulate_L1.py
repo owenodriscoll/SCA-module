@@ -6,7 +6,7 @@ from drama.performance.sar.antenna_patterns import sinc_bp, phased_array
 from leakage.misc import calculate_distance
 from leakage.utils import mean_along_azimuth
 from leakage.low_pass_filter import low_pass_filter_2D_dataset
-from leakage.conversions import dB, phase2vel, dop2vel, vel2dop, slant2ground
+from leakage.conversions import phase2vel, dop2vel, vel2dop, slant2ground
 from leakage.frequency_domain_padding import padding_fourier, da_integer_oversample_like, compute_padding_1D
 from leakage.uncertainties import decorrelation, pulse_pair_coherence, generate_complex_speckle, speckle_intensity, speckle_coherence
 
@@ -213,12 +213,13 @@ def add_L1_uncertainties(
     )
 
     # ----------------------------
-    # ---- Compute coehrences ----
+    # ---- Compute coherences ----
     # ----------------------------
     # calculates average azimuthal beam standard deviation within -3 dB
-    beam_db = dB(data_cube_resamp.beam)
+    # NOTE samples where the beam is unknown (nan, e.g. beyond the extent of the beam pattern) count as outside the -3 dB beam
+    beam = data_cube_resamp.beam
     beam_3dB = (
-        xr.where((beam_db - beam_db.max(dim=dim_az_beam)) < -3, np.nan, 1)
+        xr.where(beam >= 10 ** (-3 / 10) * beam.max(dim=dim_az_beam), 1, np.nan)
         * data_cube_resamp.az_angle_wrt_boresight_slant # in radians, antenna-frame angle
     )
     sigma_az_angle = beam_3dB.std(dim=dim_az_beam).mean().values * 1
@@ -374,8 +375,12 @@ def compute_true_observations(ds_cube, var_nrcs, var_inc, dim_az_beam, v_sat_orb
     """
     Integrates NRCS, Doppler and the geometric Doppler (leakage) over the azimuth beam.
     v_sat_orbit is the satellite velocity used for the geometric Doppler.
+
+    NOTE where the azimuth window extends beyond the beam pattern the beam is unknown (nan). These samples are given zero gain,
+    i.e. they are ignored in the beam integrals
     """
     data_cube = ds_cube.copy()
+    data_cube["beam"] = data_cube["beam"].fillna(0)
 
     data_cube["beam_weight"] = data_cube["beam"] / mean_along_azimuth(
         data_cube["beam"], 
