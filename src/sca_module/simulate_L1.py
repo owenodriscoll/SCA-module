@@ -8,7 +8,7 @@ from leakage.utils import mean_along_azimuth
 from leakage.low_pass_filter import low_pass_filter_2D_dataset
 from leakage.conversions import dB, phase2vel, dop2vel, vel2dop, slant2ground
 from leakage.frequency_domain_padding import padding_fourier, da_integer_oversample_like, compute_padding_1D
-from leakage.uncertainties import decorrelation, pulse_pair_coherence, generate_complex_speckle, speckle_intensity, phase_error_generator, speckle_coherence, phase_error_generator_2D, generate_correlated_complex_speckle
+from leakage.uncertainties import decorrelation, pulse_pair_coherence, generate_complex_speckle, speckle_intensity, phase_error_generator, speckle_coherence, phase_error_generator_2D
 
 
 def create_observation_cube(
@@ -223,48 +223,46 @@ def add_L1_uncertainties(
     T_corr_Doppler = 1 / (np.sqrt(2) * wavenumber * vx_sat * sigma_az_angle)  
     T_corr_surface = 3.29 * Lambda / U
 
+    # -------------------------------------
+    # ---- pulse-pair echo overlap ----
+    # -------------------------------------
+    # the echoes of both pulses overlap in the receiver: with time referenced to the first pulse, range gate r also
+    # receives the echo of the second pulse from r - offset, and the sample T_pp later the echo of the first pulse from r + offset
+    # NOTE divided by two for two way travel time
+    pulse_pair_slant_range_offset = T_pp * scipy.constants.c / 2
+    # data_cube_resamp is uniform in slant range, so the offset is an integer number of samples (rounding error ~10 m)
+    offset_samples = int(np.round(pulse_pair_slant_range_offset / grid_spacing_slant_range))
+
+    # NOTE the clutter is unknown where r -+ offset falls outside the scene: these cells are nan (one offset at either edge)
+    nrcs_scat = data_cube_resamp['nrcs_scat']
+    nrcs_scat_near = nrcs_scat.shift({dim_range: offset_samples})   # at r - offset
+    nrcs_scat_far = nrcs_scat.shift({dim_range: -offset_samples})   # at r + offset
+
+    # signal-to-clutter coherence from expected (speckle-free) powers: of the two samples T_pp apart only the echoes from r are
+    # correlated, the clutter comes from r - offset in one and from r + offset in the other. Equals SCR / (1 + SCR) = 0.5 for uniform NRCS
+    data_cube_resamp["gamma_SCR"] = nrcs_scat / np.sqrt((nrcs_scat + nrcs_scat_near) * (nrcs_scat + nrcs_scat_far))
+
+    gamma_speckle = speckle_coherence(T_pp=T_pp, T_corr_surface=T_corr_surface, T_corr_Doppler=T_corr_Doppler)
+
     # ------------------------
     # ---- adding speckle ----
     # ------------------------
-    gamma_speckle = speckle_coherence(
-        T_pp=T_pp,
-        T_corr_surface=T_corr_surface,
-        T_corr_Doppler=T_corr_Doppler,
-    )
-
-    # compute speckle for the first pulse
     speckle_c = generate_complex_speckle(
         da_ones_independent_slant_range.shape, random_state=random_state
     )
-
-    # speckle for the second pulse is correlated to the first, we must use a different random state for the uncorrelated part
-    speckle_c_displaced = generate_correlated_complex_speckle(speckle_c, correlation=gamma_speckle, random_state=random_state+1)
-
     da_speckle_c = speckle_c * da_ones_independent_slant_range
-    da_speckle_c_displaced = speckle_c_displaced * da_ones_independent_slant_range
     da_speckle_c_padded = padding_fourier(da_speckle_c, padding=(pad, pad), dimension=dim_to_pad_name)
-    da_speckle_c_displaced_padded = padding_fourier(da_speckle_c_displaced, padding=(pad, pad), dimension=dim_to_pad_name)
 
     # since iid noise, we can clip time domain to correct dimensions without affecting statistics
     shape_ref = data_cube_resamp[var_reference].shape
     da_speckle_c_padded_cut = da_speckle_c_padded[: shape_ref[0], : shape_ref[1]]
-    da_speckle_c_displaced_padded_cut = da_speckle_c_displaced_padded[: shape_ref[0], : shape_ref[1]]
-
     speckle = speckle_intensity(da_speckle_c_padded_cut)
-    speckle_displaced = speckle_intensity(da_speckle_c_displaced_padded_cut)
-    nrcs_pulse_1 = data_cube_resamp['nrcs_scat'] * speckle.data
-    nrcs_pulse_2 = data_cube_resamp['nrcs_scat'] * speckle_displaced.data
 
-    # displace the second pulse down slant range and interpolate back to grid spacing
-    # NOTE divided by two for two way travel time
-    pulse_pair_slant_range_offset = T_pp * scipy.constants.c / 2
-    nrcs_pulse_2 = nrcs_pulse_2.assign_coords(grg = data_cube_resamp.grg - pulse_pair_slant_range_offset).interp(grg = data_cube_resamp.grg)
-
-    # add both pulses together
-    # NOTE divided by two to keep power the same
-    data_cube_resamp["nrcs_scat_speckle_pulse_1"] = nrcs_pulse_1 / 2
-    data_cube_resamp["nrcs_scat_speckle_pulse_2"] = nrcs_pulse_2 / 2
-    data_cube_resamp["nrcs_scat_speckle"] = (nrcs_pulse_1 + nrcs_pulse_2)/2
+    # each pulse carries half the power. The overlapping echoes add as complex fields before detection,
+    # so a single (single-look) speckle realisation applies to their combined power
+    # range referenced to the second pulse: gate r holds the echo of the second pulse from r and of the first pulse from r + offset
+    # NOTE assumes one detected sample per range gate.
+    data_cube_resamp["nrcs_scat_speckle"] = (nrcs_scat + nrcs_scat_far) / 2 * speckle.data
 
     # re-interpolate to higher sampling to maintain uniform ground samples
     data_cube_resamp = data_cube_resamp.astype("float32")
@@ -299,22 +297,17 @@ def add_L1_uncertainties(
     
     elif not fixed_SCR:
 
-        temp_independent_slant_range = np.linspace(data_cube_resamp[dim_range].min(), data_cube_resamp[dim_range].max(), da_ones_independent_slant_range.sizes[dim_to_pad_name])
-        SNR_2D = (data_cube_resamp.nrcs_scat_speckle_pulse_2 / data_cube_resamp.nrcs_scat_speckle_pulse_1).interp({dim_range:temp_independent_slant_range}, method=interpolator)
-
-        gamma = pulse_pair_coherence(
-            T_pp=T_pp,
-            T_corr_surface=T_corr_surface,
-            T_corr_Doppler=T_corr_Doppler,
-            SNR=SNR_2D
+        # signal-to-clutter coherence per independent sample, positionally aligned with da_ones_independent_slant_range (same coarsening)
+        gamma_SCR_independent = (
+            data_cube_resamp["gamma_SCR"]
+            .transpose(*data_cube_resamp[var_reference].dims)
+            .coarsen({dim_range: 2}, boundary="trim")
+            .mean()
         )
-        # gamma_sncr = (SNR_2D / (1 + SNR_2D)).mean().values
-        # print("gamma SNR:", gamma_sncr)
-        # print("gamma (mean):", gamma.mean().values)
+        gamma = gamma_speckle * gamma_SCR_independent
 
         # here we use a different random state again, to avoid some artifical correlation with speckle
         phase_uncertainty = phase_error_generator_2D(gamma.data, theta=0, random_state=random_state + 2, n_bins=1001)
-        # phase_uncertainty = phase_error_generator_2D(gamma_2D.data/gamma_2D.data * 0.75, theta=0, random_state=random_state + 2, n_bins=1001)
     else: 
         raise ValueError("fixed_SCR must be either True or False")
 
