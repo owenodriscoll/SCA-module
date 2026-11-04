@@ -447,13 +447,13 @@ def compute_lpf_cube(
         window = 'hann',
         crop_edges = False,
     ):
-
-    data_lpf = [name + "_lpf" for name in data_2_lpf]
+    """
+    Low-pass filters the variables in data_2_lpf to the product resolution, adding them as f"{name}_lpf".
+    Nans are excluded by normalised convolution.
+    """
 
     ds = ds_cube.copy()
-    # we have to make sure that all arrays have the same dimension order prior to low-pass filtering
-    ds[data_lpf] = low_pass_filter_2D_dataset(
-        ds[data_2_lpf],
+    kwargs = dict(
         cutoff_frequency=1 / (resolution_product),
         fs_x=fs_x,
         fs_y=fs_y,
@@ -461,6 +461,21 @@ def compute_lpf_cube(
         fill_nans=True,
         crop_edges=crop_edges,
     )
+    # we have to make sure that all arrays have the same dimension order prior to low-pass filtering
+    filtered = low_pass_filter_2D_dataset(ds[data_2_lpf], **kwargs)
+
+    # normalised convolution: nans are filled with 0 before filtering, so the filtered valid-sample mask is divided out.
+    # Averages then only run over valid samples, and nans (swath edges, land) no longer pull the result towards 0.
+    # Without nans the weight is 1. Each distinct mask is filtered once
+    masks, mask_of = {}, {}
+    for name in data_2_lpf:
+        valid = np.isfinite(ds[name]).astype("float32")
+        mask_of[name] = next((key for key, mask in masks.items() if mask.equals(valid)), name)
+        masks.setdefault(mask_of[name], valid)
+    weights = low_pass_filter_2D_dataset(xr.Dataset(masks), **kwargs)
+
+    for name in data_2_lpf:
+        ds[name + "_lpf"] = filtered[name] / weights[mask_of[name]]
     return ds
 
 def combine_pulse_pair(
