@@ -69,7 +69,7 @@ def create_observation_cube(
 
     return data
 
-def compute_beam_pattern(az_angle_wrt_boresight: np.array, grg_angle_wrt_boresight: np.array, antenna_elements: int, antenna_weighting: float, antenna_length: float, antenna_height: float, f0: float, beam_pattern: str):
+def compute_beam_pattern(az_angle_wrt_boresight_slant: np.array, grg_angle_wrt_boresight: np.array, antenna_elements: int, antenna_weighting: float, antenna_length: float, antenna_height: float, f0: float, beam_pattern: str):
     """
     Computes a beam pattern to be applied along the entire dataset.
     # NOTE The following computations are directly computed, a delayed lazy computation may be better
@@ -79,6 +79,8 @@ def compute_beam_pattern(az_angle_wrt_boresight: np.array, grg_angle_wrt_boresig
 
     Input
     -----
+    az_angle_wrt_boresight_slant: np.array;
+        azimuth angle w.r.t. boresight in the slant plane (antenna frame), in radians, i.e. arcsin(az / slant range)
     antenna_elements int; 
         number of anetenna elements that are considered in beam tapering, only affects when beam pattern = phased_array
     antenna_weighting: 
@@ -88,14 +90,14 @@ def compute_beam_pattern(az_angle_wrt_boresight: np.array, grg_angle_wrt_boresig
     # Assumes same pattern on transmit and receive
     if beam_pattern == "sinc":
         beam_az = sinc_bp(
-            sin_angle=np.sin(az_angle_wrt_boresight),
+            sin_angle=np.sin(az_angle_wrt_boresight_slant),
             L=antenna_length,
             f0=f0,
         )
         
     elif beam_pattern == "phased_array":
         beam_az = phased_array(
-            sin_angle=np.sin(az_angle_wrt_boresight),
+            sin_angle=np.sin(az_angle_wrt_boresight_slant),
             L=antenna_length,
             f0=f0,
             N=antenna_elements,
@@ -210,7 +212,7 @@ def add_L1_uncertainties(
     beam_db = dB(data_cube_resamp.beam)
     beam_3dB = (
         xr.where((beam_db - beam_db.max(dim=dim_az_beam)) < -3, np.nan, 1)
-        * data_cube_resamp.az_angle_wrt_boresight # in radians
+        * data_cube_resamp.az_angle_wrt_boresight_slant # in radians, antenna-frame angle
     )
     sigma_az_angle = beam_3dB.std(dim=dim_az_beam).mean().values * 1
     # print(sigma_az_angle)
@@ -352,9 +354,19 @@ def compute_cube_observation_geometry(ds_cube, dim_az_beam, dim_az_slow_time, di
             x=data_cube["distance_ground"], y=sat_height
         )
 
-    data_cube["az_angle_wrt_boresight"] = np.arcsin(
+    # azimuth angle in the slant plane (antenna frame): sin = az / slant range
+    # use for the antenna beam pattern and the beam's angular spread (Doppler decorrelation time)
+    # NOTE its sine already is the projection of the along-track direction onto the line of sight,
+    # so it must not be combined with an additional sin(incidence) when computing Doppler
+    data_cube["az_angle_wrt_boresight_slant"] = np.arcsin(
         (data_cube[dim_az_beam]) / data_cube["distance_slant_range"]
         ) # NOTE arcsin instead of tan as distance_slant_range includes azimuthal angle
+
+    # azimuth angle in the ground plane: sin = az / ground distance
+    # use with vel2dop, which itself projects from the ground plane onto the line of sight via sin(incidence)
+    data_cube["az_angle_wrt_boresight_ground"] = np.arcsin(
+        (data_cube[dim_az_beam]) / data_cube["distance_ground"]
+        )
 
     data_cube["grg_angle_wrt_boresight"] = np.deg2rad(
         data_cube[var_inc] - boresight_elevation_angle_scat
@@ -362,7 +374,7 @@ def compute_cube_observation_geometry(ds_cube, dim_az_beam, dim_az_slow_time, di
     
     return data_cube
 
-def compute_true_observations(ds_cube, var_nrcs, var_inc, dim_az_beam, vx_sat, Lambda, var_azimuth_angle_wrt_boresight: str = "az_angle_wrt_boresight"):
+def compute_true_observations(ds_cube, var_nrcs, var_inc, dim_az_beam, vx_sat, Lambda, var_azimuth_angle_wrt_boresight: str = "az_angle_wrt_boresight_ground"):
     data_cube = ds_cube.copy()
 
     data_cube["beam_weight"] = data_cube["beam"] / mean_along_azimuth(
@@ -385,6 +397,9 @@ def compute_true_observations(ds_cube, var_nrcs, var_inc, dim_az_beam, vx_sat, L
         velocity=vx_sat,
         Lambda=Lambda,
         angle_incidence=np.radians(data_cube[var_inc]),  # NOTE assumes flat Earth
+        # NOTE vel2dop expects the ground-plane azimuth angle; passing the slant-plane angle applies sin(incidence) twice
+        # NOTE var_inc is the zero-Doppler incidence, not the local incidence at each az_beam offset;
+        # this leaves dop_geom up to ~0.2 % low at the footprint edge at near range, symmetric in azimuth
         angle_azimuth=data_cube[var_azimuth_angle_wrt_boresight],
         degrees=False,
     )
