@@ -8,7 +8,7 @@ from leakage.utils import mean_along_azimuth
 from leakage.low_pass_filter import low_pass_filter_2D_dataset
 from leakage.conversions import dB, phase2vel, dop2vel, vel2dop, slant2ground
 from leakage.frequency_domain_padding import padding_fourier, da_integer_oversample_like, compute_padding_1D
-from leakage.uncertainties import decorrelation, pulse_pair_coherence, generate_complex_speckle, speckle_intensity, phase_error_generator, speckle_coherence, phase_error_generator_2D
+from leakage.uncertainties import decorrelation, pulse_pair_coherence, generate_complex_speckle, speckle_intensity, speckle_coherence
 
 
 def create_observation_cube(
@@ -136,6 +136,12 @@ def add_L1_uncertainties(
     - first the data is interpolated to a slant-range spacing defined by the resolution (e.g. 150 m slant range resolution is 75m slant range grid)
     - then pulse-pair noise and speckle are generated per resolution cell, i.e. one noise sample per two grid cells
     - using zero-padding in the Fourier domain this is interpolated to noise/speckle at a 75 m spacing
+    - the echoes of both pulses are simulated per resolution cell (same scatterers, decorrelated by surface and platform motion),
+      overlapping with the echo of the other pulse from +- the pulse-pair offset. The received sample referenced to the second pulse
+      gives the NRCS speckle, and the product of the two samples T_pp apart the pulse-pair noise
+    - pulse-pair noise is returned as the real and imaginary part of that lag product, `pp_re` and `pp_im`, not as a velocity.
+      Low-pass filter these and only then derive V_pp and V_sigma with combine_pulse_pair, so that the products are summed
+      as by the processor (weighted by speckle and NRCS brightness, phases averaged on the circle)
 
     :param ds: xarray Dataset containing the observation data with all variables and coordinates
     :type ds: xr.Dataset
@@ -244,12 +250,58 @@ def add_L1_uncertainties(
 
     gamma_speckle = speckle_coherence(T_pp=T_pp, T_corr_surface=T_corr_surface, T_corr_Doppler=T_corr_Doppler)
 
+    # ---------------------------------------------------
+    # ---- echoes and received samples per resolution cell ----
+    # ---------------------------------------------------
+    if fixed_SCR:
+        # uniform scene: unit-power speckle, coherence of the pair imposed directly
+        speckle_c = generate_complex_speckle(da_ones_independent_slant_range.shape, random_state=random_state)
+        gamma = pulse_pair_coherence(T_pp=T_pp, T_corr_surface=T_corr_surface, T_corr_Doppler=T_corr_Doppler, SNR=fixed_SCR)
+        u_1, u_2 = generate_complex_speckle((2, *da_ones_independent_slant_range.shape), random_state=random_state + 2)
+        sample_A, sample_B = u_1, gamma * u_1 + np.sqrt(1 - gamma**2) * u_2
+    else:
+        # expected power per resolution cell, positionally aligned with da_ones_independent_slant_range (same coarsening)
+        P = (
+            nrcs_scat.transpose(*data_cube_resamp[var_reference].dims)
+            .coarsen({dim_range: 2}, boundary="trim")
+            .mean()
+            .data
+        )
+        P = np.moveaxis(P, dim_to_pad, -1)  # range last for shifting
+        n = int(np.round(offset_samples / 2))
+
+        def shift_range(x, k):
+            """x at r - k along the last axis, nan where r - k falls outside the swath"""
+            out = np.full_like(x, np.nan)
+            if k > 0:
+                out[..., k:] = x[..., :-k]
+            else:
+                out[..., :k] = x[..., -k:]
+            return out
+
+        # each pulse carries half the power; the second pulse sees the same scatterers, decorrelated by surface and platform motion
+        u_echo, u_new = generate_complex_speckle((2, *P.shape), random_state=random_state)
+        echo_1 = np.sqrt(P / 2) * u_echo
+        echo_2 = np.sqrt(P / 2) * (gamma_speckle * u_echo + np.sqrt(1 - gamma_speckle**2) * u_new)
+
+        # clutter: echo of the second pulse from r - offset and of the first pulse from r + offset
+        # NOTE where r -+ offset falls outside the scene (or the scene is undefined) the clutter is unknown and the sample is nan, as gamma_SCR
+        clutter_near = shift_range(echo_2, n)
+        clutter_far = shift_range(echo_1, -n)
+        P_far = shift_range(P, -n)
+
+        # received samples T_pp apart, range referenced to the second pulse: sample B is also the detected NRCS sample
+        sample_A = echo_1 + clutter_near
+        sample_B = echo_2 + clutter_far
+
+        # unit-power speckle of sample B, so that NRCS speckle and pulse-pair noise come from the same echoes
+        speckle_c = sample_B / np.sqrt((P + P_far) / 2)
+        speckle_c = np.where(np.isfinite(speckle_c), speckle_c, u_echo)  # nan cells: any unit speckle keeps the padding finite, the NRCS is nan there anyway
+        speckle_c, sample_A, sample_B = [np.moveaxis(s, -1, dim_to_pad) for s in (speckle_c, sample_A, sample_B)]
+
     # ------------------------
     # ---- adding speckle ----
     # ------------------------
-    speckle_c = generate_complex_speckle(
-        da_ones_independent_slant_range.shape, random_state=random_state
-    )
     da_speckle_c = speckle_c * da_ones_independent_slant_range
     da_speckle_c_padded = padding_fourier(da_speckle_c, padding=(pad, pad), dimension=dim_to_pad_name)
 
@@ -270,70 +322,20 @@ def add_L1_uncertainties(
     # -------------------------------
     # ---- Pulse-pair uncertaity ----
     # -------------------------------
-    # # NOTE assumes no squint
-    # gamma_velocity = decorrelation(
-    # T_pp, T_corr_Doppler
-    # )  # eq 6 & 7 Rodriguez (2018), NOTE not valid for squint NOTE assumes Gaussian beam pattern
-    # gamma_temporal = decorrelation(T_pp, T_corr_surface)
-    # print("gamma D:", gamma_velocity)
-    # print("gamma TW:", gamma_temporal)
-
-    if fixed_SCR:
-        gamma = pulse_pair_coherence(
-            T_pp=T_pp,
-            T_corr_surface=T_corr_surface,
-            T_corr_Doppler=T_corr_Doppler,
-            SNR=fixed_SCR
-        )
-        # gamma_sncr = (fixed_SCR / (1 + fixed_SCR))
-        # print("gamma SNR:", gamma_sncr)
-        # print("gamma (mean):", gamma)
-
-        phase_uncertainty = phase_error_generator(
-            gamma=gamma,
-            n_samples=(da_ones_independent_slant_range.shape),
-            random_state=random_state,
-        )
-    
-    elif not fixed_SCR:
-
-        # signal-to-clutter coherence per independent sample, positionally aligned with da_ones_independent_slant_range (same coarsening)
-        gamma_SCR_independent = (
-            data_cube_resamp["gamma_SCR"]
-            .transpose(*data_cube_resamp[var_reference].dims)
-            .coarsen({dim_range: 2}, boundary="trim")
-            .mean()
-        )
-        gamma = gamma_speckle * gamma_SCR_independent
-
-        # here we use a different random state again, to avoid some artifical correlation with speckle
-        phase_uncertainty = phase_error_generator_2D(gamma.data, theta=0, random_state=random_state + 2, n_bins=1001)
-    else: 
-        raise ValueError("fixed_SCR must be either True or False")
-
-    velocity_error = phase2vel(
-        phase=phase_uncertainty, 
-        wavenumber=wavenumber,
-        T=T_pp
-    )
-    
-    da_V_pp = velocity_error * da_ones_independent_slant_range
-
-    # replace nans and infs with zero to avoid issues with padding, these will be ignored in the final product as they correspond to areas with no data
-    da_V_pp = xr.where(np.isfinite(da_V_pp), x = da_V_pp, y = 0) 
-    V_pp_c = padding_fourier(da_V_pp, padding=(pad, pad), dimension=dim_to_pad_name)
-    V_pp = V_pp_c[: shape_ref[0], : shape_ref[1]]
-    V_pp = V_pp.real # NOTE if complex part is not negligible this will slightly underestimate pulsepair noise
-
-    # here we add pulse-pair uncertainty and convert it to surface projected velocity
-    data_cube_resamp["V_pp"] = (
-        xr.zeros_like(data_cube_resamp["V_leakage_pulse_rg"]) + V_pp.data
-    ) / np.sin(np.radians(data_cube_resamp["inc_scat"])) # in radians
-
-    # combine pulse-pair ucnertainty with leakage for total V_sigma
-    data_cube_resamp["V_sigma"] = (
-        data_cube_resamp["V_leakage_pulse_rg"] + data_cube_resamp["V_pp"]
-    )
+    # the processor sums the complex lag-T_pp products and takes the phase of the sum. Each product is therefore weighted by
+    # its magnitude (speckle and NRCS brightness), and phases are averaged on the circle (velocities alias at +- Lambda / (4 T_pp)).
+    # The real and imaginary parts are stored; after low-pass filtering both, combine_pulse_pair takes the phase of the filtered product
+    lag_product = np.conj(sample_A) * sample_B
+    lag_product = {"pp_re": lag_product.real, "pp_im": lag_product.imag}
+    for name, component in lag_product.items():
+        # replace nans and infs with zero to avoid issues with padding, a zero product does not contribute to the sum
+        da_component = xr.where(np.isfinite(component), component, 0) * da_ones_independent_slant_range
+        component_c = padding_fourier(da_component, padding=(pad, pad), dimension=dim_to_pad_name)
+        component_c = component_c[: shape_ref[0], : shape_ref[1]].real # NOTE if complex part is not negligible this will slightly underestimate pulsepair noise
+        data_cube_resamp[name] = xr.zeros_like(data_cube_resamp[var_reference]) + component_c.data
+        if not fixed_SCR:
+            # nan where the clutter (or the scene) is unknown, as gamma_SCR
+            data_cube_resamp[name] = data_cube_resamp[name].where(data_cube_resamp["gamma_SCR"].notnull())
 
     return data_cube_resamp
 
@@ -459,4 +461,51 @@ def compute_lpf_cube(
         fill_nans=True,
         crop_edges=crop_edges,
     )
+    return ds
+
+def combine_pulse_pair(
+        ds,
+        Lambda,
+        T_pp,
+        suffix = "",
+        var_inc = "inc_scat",
+    ):
+    """
+    Converts the pulse-pair lag product from add_L1_uncertainties into a surface-projected velocity error V_pp
+    and adds it to the leakage to obtain V_sigma (and V_sigma_net if the net leakage is present).
+
+    To be applied after low-pass filtering: the phase is taken from the filtered lag product, so that resolved samples are
+    summed as complex products (as by a pulse-pair processor) rather than averaged as wrapped phases. Use suffix = "" for the native-resolution fields and
+    suffix = "_lpf" for the product-resolution fields.
+
+    Input
+    -----
+    ds: xr.Dataset,
+        dataset containing f"pp_re{suffix}", f"pp_im{suffix}", f"V_leakage_pulse_rg{suffix}" and var_inc (in degrees),
+        and optionally f"V_leakage_pulse_rg_net{suffix}"
+    Lambda: float,
+        radar wavelength, in meters
+    T_pp: float,
+        pulse-pair separation time, in seconds
+    suffix: str,
+        suffix of the fields to combine, e.g. "_lpf" for the low-pass filtered fields
+
+    Returns
+    -------
+    ds: xr.Dataset,
+        copy of the input with f"V_pp{suffix}", f"V_sigma{suffix}" and, if available, f"V_sigma_net{suffix}" added
+    """
+    ds = ds.copy()
+
+    phase = np.arctan2(ds[f"pp_im{suffix}"], ds[f"pp_re{suffix}"])
+    ds[f"V_pp{suffix}"] = phase2vel(
+        phase=phase,
+        wavenumber=2 * np.pi / Lambda,
+        T=T_pp
+    ) / np.sin(np.radians(ds[var_inc])) # surface projected
+
+    ds[f"V_sigma{suffix}"] = ds[f"V_leakage_pulse_rg{suffix}"] + ds[f"V_pp{suffix}"]
+    if f"V_leakage_pulse_rg_net{suffix}" in ds:
+        ds[f"V_sigma_net{suffix}"] = ds[f"V_leakage_pulse_rg_net{suffix}"] + ds[f"V_pp{suffix}"]
+
     return ds
