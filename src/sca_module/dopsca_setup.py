@@ -31,7 +31,7 @@ class DopSCAConfig:
     grg_min: float = 550E3                          # Minimum ground range [m] (within range main lobe)
     grid_spacing_target: int = 1000                 # Target grid spacing [m] SWB simulations are loaded on a 1 km grid, 
                                                     #here you can potentially oversample to avoid aliasing in azimuth
-    grid_spacing_slant_range_SCA: float = 75        # Slant range resolution [m]
+    grid_spacing_slant_range_SCA: float = 75        # Slant range spacing [m]
     az_footprint_cutoff: int = 80_000               # Azimuth footprint cutoff [m]
     resolution_product: int = 50_000                # Product resolution [m], Hoogeboom et al. (2018)
     product_averaging_window: str = "hann"          # Averaging window type
