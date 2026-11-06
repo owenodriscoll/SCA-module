@@ -73,7 +73,7 @@ def create_observation_cube(
 def compute_beam_pattern(az_angle_wrt_boresight_slant: np.array, grg_angle_wrt_boresight: np.array, antenna_elements: int, antenna_weighting: float, antenna_length: float, antenna_height: float, f0: float, beam_pattern: str):
     """
     Computes a beam pattern to be applied along the entire dataset.
-    # NOTE The following computations are directly computed, a delayed lazy computation may be better
+    # NOTE The following computations are directly computed, a delayed lazy computation may be more efficient
     # NOTE Currently tapering only azimuth
     # NOTE Same beam pattern assumed for transmit and receive
     # NOTE Beam patterns are already in intensity, square is only needed for two-way pattern
@@ -222,6 +222,8 @@ def add_L1_uncertainties(
         xr.where(beam >= 10 ** (-3 / 10) * beam.max(dim=dim_az_beam), 1, np.nan)
         * data_cube_resamp.az_angle_wrt_boresight_slant # in radians, antenna-frame angle
     )
+
+    # NOTE maybe this needs to be power weighted
     sigma_az_angle = beam_3dB.std(dim=dim_az_beam).mean().values * 1
     # print(sigma_az_angle)
 
@@ -234,8 +236,7 @@ def add_L1_uncertainties(
     # -------------------------------------
     # ---- pulse-pair echo overlap ----
     # -------------------------------------
-    # the echoes of both pulses overlap in the receiver: with time referenced to the first pulse, range gate r also
-    # receives the echo of the second pulse from r - offset, and the sample T_pp later the echo of the first pulse from r + offset
+    # the echoes of both pulses overlap: with time referenced to the first pulse, range cell r also receives the echo of the second pulse from r - offset, and the sample T_pp later the echo of the first pulse from r + offset
     # NOTE divided by two for two way travel time
     pulse_pair_slant_range_offset = T_pp * scipy.constants.c / 2
     # data_cube_resamp is uniform in slant range, so the offset is an integer number of samples (rounding error ~10 m)
@@ -249,8 +250,6 @@ def add_L1_uncertainties(
     # signal-to-clutter coherence from expected (speckle-free) powers: of the two samples T_pp apart only the echoes from r are
     # correlated, the clutter comes from r - offset in one and from r + offset in the other. Equals SCR / (1 + SCR) = 0.5 for uniform NRCS
     data_cube_resamp["gamma_SCR"] = nrcs_scat / np.sqrt((nrcs_scat + nrcs_scat_near) * (nrcs_scat + nrcs_scat_far))
-
-    gamma_speckle = speckle_coherence(T_pp=T_pp, T_corr_surface=T_corr_surface, T_corr_Doppler=T_corr_Doppler)
 
     # ---------------------------------------------------
     # ---- echoes and received samples per resolution cell ----
@@ -282,6 +281,7 @@ def add_L1_uncertainties(
             return out
 
         # each pulse carries half the power; the second pulse sees the same scatterers, decorrelated by surface and platform motion
+        gamma_speckle = speckle_coherence(T_pp=T_pp, T_corr_surface=T_corr_surface, T_corr_Doppler=T_corr_Doppler)
         u_echo, u_new = generate_complex_speckle((2, *P.shape), random_state=random_state)
         echo_1 = np.sqrt(P / 2) * u_echo
         echo_2 = np.sqrt(P / 2) * (gamma_speckle * u_echo + np.sqrt(1 - gamma_speckle**2) * u_new)
@@ -314,18 +314,15 @@ def add_L1_uncertainties(
 
     # each pulse carries half the power. The overlapping echoes add as complex fields before detection,
     # so a single (single-look) speckle realisation applies to their combined power
-    # range referenced to the second pulse: gate r holds the echo of the second pulse from r and of the first pulse from r + offset
-    # NOTE assumes one detected sample per range gate.
+    # range referenced to the second pulse: cell r holds the echo of the second pulse from r and of the first pulse from r + offset
+    # NOTE assumes one detected sample per range cell.
     data_cube_resamp["nrcs_scat_speckle"] = (nrcs_scat + nrcs_scat_far) / 2 * speckle.data
-
-    # re-interpolate to higher sampling to maintain uniform ground samples
     data_cube_resamp = data_cube_resamp.astype("float32")
 
     # -------------------------------
     # ---- Pulse-pair uncertaity ----
     # -------------------------------
-    # the processor sums the complex lag-T_pp products and takes the phase of the sum. Each product is therefore weighted by
-    # its magnitude (speckle and NRCS brightness), and phases are averaged on the circle (velocities alias at +- Lambda / (4 T_pp)).
+    # Each product is weighted by its magnitude (speckle and NRCS brightness), and phases are averaged on the circle
     # The real and imaginary parts are stored; after low-pass filtering both, combine_pulse_pair takes the phase of the filtered product
     lag_product = np.conj(sample_A) * sample_B
     lag_product = {"pp_re": lag_product.real, "pp_im": lag_product.imag}
@@ -408,7 +405,7 @@ def compute_true_observations(ds_cube, var_nrcs, var_inc, dim_az_beam, v_sat_orb
         angle_incidence=np.radians(data_cube[var_inc]),  # NOTE assumes flat Earth
         # NOTE vel2dop expects the ground-plane azimuth angle; passing the slant-plane angle applies sin(incidence) twice
         # NOTE var_inc is the zero-Doppler incidence, not the local incidence at each az_beam offset;
-        # this leaves dop_geom up to ~0.2 % low at the footprint edge at near range, symmetric in azimuth
+        # NOTE assumes a zero Doppler centroid at boresight (no Earth-rotation or attitude residual): the geometric Doppler is zero at az_beam = 0
         angle_azimuth=data_cube[var_azimuth_angle_wrt_boresight],
         degrees=False,
     )
@@ -439,7 +436,6 @@ def compute_true_observations(ds_cube, var_nrcs, var_inc, dim_az_beam, v_sat_orb
     )
 
     # beam and backscatter weighted lag product of the geometric Doppler. Its phase is interpreted as geophysical Doppler, i.e. Leakage
-    # NOTE phases beyond +- pi (|dop_geom| > 1 / (2 T_pp)) alias, as in the instrument
     lag_product_geom = mean_along_azimuth(
         data_cube["weight"] * np.exp(1j * 2 * np.pi * T_pp * data_cube["dop_geom"]),
         azimuth_dim = dim_az_beam
