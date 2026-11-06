@@ -129,6 +129,7 @@ def add_L1_uncertainties(
         fixed_SCR: bool = None,
         var_reference: str = "V_leakage_pulse_rg",
         var_leakage: str = "V_leakage_pulse_rg",
+        var_signal: str = "V_pulse_rg",
         var_inc: str = "inc_scat",
         interpolator: str = "linear",
         random_state: int = 42,
@@ -143,8 +144,10 @@ def add_L1_uncertainties(
       overlapping with the echo of the other pulse from +- the pulse-pair offset. The received sample referenced to the second pulse
       gives the NRCS speckle, and the product of the two samples T_pp apart the pulse-pair noise
     - pulse-pair noise is returned as the real and imaginary part of that lag product, `pp_re` and `pp_im`, not as a velocity.
-      The same lag product rotated by the leakage of its resolution cell is returned as `pp_re_sigma` and `pp_im_sigma`.
-      Optionally correct the leakage with correct_lag_product_leakage, low-pass filter, and only then derive V_pp and V_sigma with combine_pulse_pair,
+      The same lag product rotated by the leakage of its resolution cell is returned as `pp_re_sigma` and `pp_im_sigma`,
+      and rotated by the leakage and the geophysical signal as `pp_re_signal_and_sigma` and `pp_im_signal_and_sigma`.
+      Optionally correct the leakage with correct_lag_product_leakage, low-pass filter, and only then derive V_pp, V_sigma and
+      V_signal_and_sigma with combine_pulse_pair,
       so that the products are summed as by the processor (weighted by speckle and NRCS brightness, phases averaged on the circle)
 
     :param ds: xarray Dataset containing the observation data with all variables and coordinates
@@ -171,7 +174,9 @@ def add_L1_uncertainties(
     :type var_reference: str
     :param var_leakage: leakage variable name (surface-projected velocity) that rotates the lag product, defaults to "V_leakage_pulse_rg"
     :type var_leakage: str
-    :param var_inc: incidence angle variable name (in degrees) of the leakage, defaults to "inc_scat"
+    :param var_signal: geophysical signal variable name (surface-projected velocity) that also rotates `pp_*_signal_and_sigma`, defaults to "V_pulse_rg"
+    :type var_signal: str
+    :param var_inc: incidence angle variable name (in degrees) of the leakage and signal, defaults to "inc_scat"
     :type var_inc: str
     :param interpolator: interpolation method to use (e.g., 'linear'), defaults to "linear"
     :type interpolator: str
@@ -333,7 +338,8 @@ def add_L1_uncertainties(
     # The real and imaginary parts are stored; after low-pass filtering both, combine_pulse_pair takes the phase of the filtered product
     lag_product = np.conj(sample_A) * sample_B
 
-    # the leakage rotates the lag product of each resolution cell by its phase (same coarsening as P), before the Fourier interpolation
+    # the leakage (and the geophysical signal) rotate the lag product of each resolution cell by their phase (same coarsening as P),
+    # before the Fourier interpolation
     def resolution_cell_phase(V):
         return (
             velocity_to_lag_phase(V, data_cube_resamp[var_inc], Lambda=Lambda, T_pp=T_pp)
@@ -343,10 +349,12 @@ def add_L1_uncertainties(
             .data
         )
     lag_product_sigma = lag_product * np.exp(1j * resolution_cell_phase(data_cube_resamp[var_leakage]))
+    lag_product_signal_and_sigma = lag_product * np.exp(1j * resolution_cell_phase(data_cube_resamp[var_leakage] + data_cube_resamp[var_signal]))
 
     lag_product = {
         "pp_re": lag_product.real, "pp_im": lag_product.imag,
         "pp_re_sigma": lag_product_sigma.real, "pp_im_sigma": lag_product_sigma.imag,
+        "pp_re_signal_and_sigma": lag_product_signal_and_sigma.real, "pp_im_signal_and_sigma": lag_product_signal_and_sigma.imag,
     }
     for name, component in lag_product.items():
         # replace nans and infs with zero to avoid issues with padding, a zero product does not contribute to the sum
@@ -358,8 +366,10 @@ def add_L1_uncertainties(
             # nan where the clutter (or the scene) is unknown, as gamma_SCR
             data_cube_resamp[name] = data_cube_resamp[name].where(data_cube_resamp["gamma_SCR"].notnull())
         if name.endswith("_sigma"):
-            # nan where the leakage is unknown
+            # nan where the leakage (or the signal) is unknown
             data_cube_resamp[name] = data_cube_resamp[name].where(data_cube_resamp[var_leakage].notnull())
+        if name.endswith("_signal_and_sigma"):
+            data_cube_resamp[name] = data_cube_resamp[name].where(data_cube_resamp[var_signal].notnull())
 
     return data_cube_resamp
 
@@ -435,28 +445,9 @@ def compute_true_observations(ds_cube, var_nrcs, var_inc, dim_az_beam, v_sat_orb
         degrees=False,
     )
 
-    data_cube["dop_beam_weighted"] = (
-        data_cube["dop"] * data_cube["weight"]
-    )
-
-    data_cube["V"] = dop2vel(
-        Doppler=data_cube["dop_beam_weighted"],
-        Lambda=Lambda,
-        angle_incidence=np.radians(data_cube[var_inc]),
-        angle_azimuth=np.pi
-        / 2,  # the geometric doppler is interpreted as radial motion, so azimuth angle component must result in value of 1 (i.e. pi/2)
-        degrees=False,
-    )
-
     # calculate scatterometer nrcs at scatterometer resolution (integrate over beam)
     data_cube["nrcs_scat"] = mean_along_azimuth(
         data_cube[var_nrcs] * data_cube["beam_weight"],
-        azimuth_dim = dim_az_beam
-    )
-
-    # integrate Doppler over beam
-    data_cube[["dop_pulse_rg", "V_pulse_rg"]] = mean_along_azimuth(
-        data_cube[["dop_beam_weighted", "V"]],
         azimuth_dim = dim_az_beam
     )
 
@@ -472,6 +463,25 @@ def compute_true_observations(ds_cube, var_nrcs, var_inc, dim_az_beam, v_sat_orb
         angle_incidence=np.radians(data_cube["inc_scat"]),
         angle_azimuth=np.pi
         / 2,  # the geometric doppler is interpreted as radial motion, so azimuth angle component must result in value of 1 (i.e. pi/2)
+        degrees=False,
+    )
+
+    # the geophysical Doppler rotates each scatterer on top of its geometric Doppler, so it is integrated over the beam from the
+    # lag product of both: the total phase minus the leakage. Weighting the geophysical Doppler on its own would ignore that scatterers
+    # whose geometric phase points away from the sum turn it less, or the opposite way
+    lag_product_total = mean_along_azimuth(
+        data_cube["weight"] * np.exp(1j * 2 * np.pi * T_pp * (data_cube["dop_geom"] + data_cube["dop"])),
+        azimuth_dim = dim_az_beam
+    )
+    # phase of the total relative to the leakage, taken in one step so that it cannot wrap
+    lag_product_signal = lag_product_total * np.conj(lag_product_geom)
+    data_cube["dop_pulse_rg"] = np.arctan2(lag_product_signal.imag, lag_product_signal.real) / (2 * np.pi * T_pp)
+    data_cube["V_pulse_rg"] = dop2vel(
+        Doppler=data_cube["dop_pulse_rg"],
+        Lambda=Lambda,
+        angle_incidence=np.radians(data_cube["inc_scat"]),
+        angle_azimuth=np.pi
+        / 2,  # the geophysical doppler is interpreted as radial motion, so azimuth angle component must result in value of 1 (i.e. pi/2)
         degrees=False,
     )
     return data_cube
@@ -547,8 +557,8 @@ def correct_lag_product_leakage(
         var_inc = "inc_scat",
     ):
     """
-    Corrects the leakage in the lag product from add_L1_uncertainties (pp_re_sigma and pp_im_sigma, rotated by the true leakage
-    per resolution cell) by rotating it by minus the estimated leakage phase, giving pp_re_sigma_net and pp_im_sigma_net.
+    Corrects the leakage in the lag products from add_L1_uncertainties (pp_*_sigma and pp_*_signal_and_sigma, rotated by the true
+    leakage per resolution cell) by rotating them by minus the estimated leakage phase, giving pp_*_sigma_net and pp_*_signal_and_sigma_net.
 
     To be applied before low-pass filtering, so that the corrected products are summed as complex products, as by the processor.
     The estimated leakage is V_leakage_pulse_rg - V_leakage_pulse_rg_net.
@@ -557,7 +567,8 @@ def correct_lag_product_leakage(
     Input
     -----
     ds: xr.Dataset,
-        dataset containing "pp_re_sigma", "pp_im_sigma", "V_leakage_pulse_rg", "V_leakage_pulse_rg_net" and var_inc (in degrees)
+        dataset containing "pp_re_sigma", "pp_im_sigma", "pp_re_signal_and_sigma", "pp_im_signal_and_sigma",
+        "V_leakage_pulse_rg", "V_leakage_pulse_rg_net" and var_inc (in degrees)
     Lambda: float,
         radar wavelength, in meters
     T_pp: float,
@@ -566,15 +577,16 @@ def correct_lag_product_leakage(
     Returns
     -------
     ds: xr.Dataset,
-        copy of the input with the corrected lag product added
+        copy of the input with the corrected lag products added
     """
     ds = ds.copy()
 
-    lag_product = ds["pp_re_sigma"] + 1j * ds["pp_im_sigma"]
     V_leakage_estimate = ds["V_leakage_pulse_rg"] - ds["V_leakage_pulse_rg_net"]
-    lag_product_corrected = lag_product * np.exp(-1j * velocity_to_lag_phase(V_leakage_estimate, ds[var_inc], Lambda=Lambda, T_pp=T_pp))
-    ds["pp_re_sigma_net"] = lag_product_corrected.real
-    ds["pp_im_sigma_net"] = lag_product_corrected.imag
+    correction = np.exp(-1j * velocity_to_lag_phase(V_leakage_estimate, ds[var_inc], Lambda=Lambda, T_pp=T_pp))
+    for name in ["_sigma", "_signal_and_sigma"]:
+        lag_product_corrected = (ds[f"pp_re{name}"] + 1j * ds[f"pp_im{name}"]) * correction
+        ds[f"pp_re{name}_net"] = lag_product_corrected.real
+        ds[f"pp_im{name}_net"] = lag_product_corrected.imag
 
     return ds
 
@@ -587,8 +599,9 @@ def combine_pulse_pair(
     ):
     """
     Converts the pulse-pair lag products into surface-projected velocities: V_pp from the lag product of add_L1_uncertainties
-    (pulse-pair noise only), and V_sigma from the one rotated by the leakage (the L1 error). V_sigma_net follows from
-    the leakage-corrected product of correct_lag_product_leakage, if present.
+    (pulse-pair noise only), V_sigma from the one rotated by the leakage (the L1 error), and V_signal_and_sigma from the one
+    rotated by the leakage and the geophysical signal (the measured velocity). V_sigma_net and V_signal_and_sigma_net follow from
+    the leakage-corrected products of correct_lag_product_leakage, if present.
 
     To be applied after low-pass filtering: the phase is taken from the filtered lag product, so that resolved samples are
     summed as complex products (as by a pulse-pair processor) rather than averaged as wrapped phases. Use suffix = "" for the native-resolution fields and
@@ -597,8 +610,10 @@ def combine_pulse_pair(
     Input
     -----
     ds: xr.Dataset,
-        dataset containing f"pp_re{suffix}", f"pp_im{suffix}", f"pp_re_sigma{suffix}", f"pp_im_sigma{suffix}" and var_inc (in degrees),
-        and optionally the leakage-corrected f"pp_re_sigma_net{suffix}" and f"pp_im_sigma_net{suffix}"
+        dataset containing f"pp_re{suffix}", f"pp_im{suffix}", f"pp_re_sigma{suffix}", f"pp_im_sigma{suffix}",
+        f"pp_re_signal_and_sigma{suffix}", f"pp_im_signal_and_sigma{suffix}" and var_inc (in degrees),
+        and optionally their leakage-corrected f"pp_re_sigma_net{suffix}", f"pp_im_sigma_net{suffix}",
+        f"pp_re_signal_and_sigma_net{suffix}" and f"pp_im_signal_and_sigma_net{suffix}"
     Lambda: float,
         radar wavelength, in meters
     T_pp: float,
@@ -609,7 +624,8 @@ def combine_pulse_pair(
     Returns
     -------
     ds: xr.Dataset,
-        copy of the input with f"V_pp{suffix}", f"V_sigma{suffix}" and, if available, f"V_sigma_net{suffix}" added
+        copy of the input with f"V_pp{suffix}", f"V_sigma{suffix}", f"V_signal_and_sigma{suffix}" and, if available,
+        f"V_sigma_net{suffix}" and f"V_signal_and_sigma_net{suffix}" added
     """
     ds = ds.copy()
 
@@ -622,9 +638,10 @@ def combine_pulse_pair(
         ) / np.sin(np.radians(ds[var_inc])) # surface projected
 
     ds[f"V_pp{suffix}"] = lag_product_to_velocity("")
-    ds[f"V_sigma{suffix}"] = lag_product_to_velocity("_sigma")
-    if f"pp_re_sigma_net{suffix}" in ds:
-        ds[f"V_sigma_net{suffix}"] = lag_product_to_velocity("_sigma_net")
+    for name in ["_sigma", "_signal_and_sigma"]:
+        ds[f"V{name}{suffix}"] = lag_product_to_velocity(name)
+        if f"pp_re{name}_net{suffix}" in ds:
+            ds[f"V{name}_net{suffix}"] = lag_product_to_velocity(f"{name}_net")
 
     return ds
 
