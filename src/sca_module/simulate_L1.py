@@ -403,7 +403,7 @@ def compute_cube_observation_geometry(ds_cube, dim_az_beam, dim_az_slow_time, di
     
     return data_cube
 
-def compute_true_observations(ds_cube, var_nrcs, var_inc, dim_az_beam, v_sat_orbit, Lambda, T_pp, var_azimuth_angle_wrt_boresight: str = "az_angle_wrt_boresight_ground"):
+def compute_observations(ds_cube, var_nrcs, var_inc, dim_az_beam, v_sat_orbit, Lambda, T_pp, var_azimuth_angle_wrt_boresight: str = "az_angle_wrt_boresight_ground"):
     """
     Integrates NRCS, Doppler and the geometric Doppler (leakage) over the azimuth beam.
     v_sat_orbit is the satellite velocity used for the geometric Doppler.
