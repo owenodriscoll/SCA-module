@@ -371,10 +371,14 @@ def compute_cube_observation_geometry(ds_cube, dim_az_beam, dim_az_slow_time, di
     
     return data_cube
 
-def compute_true_observations(ds_cube, var_nrcs, var_inc, dim_az_beam, v_sat_orbit, Lambda, var_azimuth_angle_wrt_boresight: str = "az_angle_wrt_boresight_ground"):
+def compute_true_observations(ds_cube, var_nrcs, var_inc, dim_az_beam, v_sat_orbit, Lambda, T_pp, var_azimuth_angle_wrt_boresight: str = "az_angle_wrt_boresight_ground"):
     """
     Integrates NRCS, Doppler and the geometric Doppler (leakage) over the azimuth beam.
     v_sat_orbit is the satellite velocity used for the geometric Doppler.
+
+    The leakage is the phase of the beam-integrated lag product: each azimuth sample rotates its share of the lag product
+    by its geometric Doppler phase over T_pp, and the pulse pair measures the phase of the sum. This differs from the
+    power-weighted mean geometric Doppler by the odd higher-order cumulants (skewness) of the weighted Doppler spectrum
 
     NOTE where the azimuth window extends beyond the beam pattern the beam is unknown (nan). These samples are given zero gain,
     i.e. they are ignored in the beam integrals
@@ -409,21 +413,8 @@ def compute_true_observations(ds_cube, var_nrcs, var_inc, dim_az_beam, v_sat_orb
         degrees=False,
     )
 
-    data_cube["dop_geom_beam_weighted"] = (
-        data_cube["dop_geom"] * data_cube["weight"]
-    ) 
     data_cube["dop_beam_weighted"] = (
         data_cube["dop"] * data_cube["weight"]
-    )
-
-    # beam and backscatter weighted geometric Doppler is interpreted as geophysical Doppler, i.e. Leakage
-    data_cube["V_leakage"] = dop2vel(
-        Doppler=data_cube["dop_geom_beam_weighted"],
-        Lambda=Lambda,
-        angle_incidence=np.radians(data_cube[var_inc]),
-        angle_azimuth=np.pi
-        / 2,  # the geometric doppler is interpreted as radial motion, so azimuth angle component must result in value of 1 (i.e. pi/2)
-        degrees=False,
     )
 
     data_cube["V"] = dop2vel(
@@ -441,10 +432,26 @@ def compute_true_observations(ds_cube, var_nrcs, var_inc, dim_az_beam, v_sat_orb
         azimuth_dim = dim_az_beam
     )
 
-    # integrate Doppler and leakage over beam
-    data_cube[["dop_geom_pulse_rg", "V_leakage_pulse_rg", "dop_pulse_rg", "V_pulse_rg"]] = mean_along_azimuth(
-        data_cube[["dop_geom_beam_weighted", "V_leakage", "dop_beam_weighted", "V"]], 
+    # integrate Doppler over beam
+    data_cube[["dop_pulse_rg", "V_pulse_rg"]] = mean_along_azimuth(
+        data_cube[["dop_beam_weighted", "V"]],
         azimuth_dim = dim_az_beam
+    )
+
+    # beam and backscatter weighted lag product of the geometric Doppler. Its phase is interpreted as geophysical Doppler, i.e. Leakage
+    # NOTE phases beyond +- pi (|dop_geom| > 1 / (2 T_pp)) alias, as in the instrument
+    lag_product_geom = mean_along_azimuth(
+        data_cube["weight"] * np.exp(1j * 2 * np.pi * T_pp * data_cube["dop_geom"]),
+        azimuth_dim = dim_az_beam
+    )
+    data_cube["dop_geom_pulse_rg"] = np.arctan2(lag_product_geom.imag, lag_product_geom.real) / (2 * np.pi * T_pp)
+    data_cube["V_leakage_pulse_rg"] = dop2vel(
+        Doppler=data_cube["dop_geom_pulse_rg"],
+        Lambda=Lambda,
+        angle_incidence=np.radians(data_cube["inc_scat"]),
+        angle_azimuth=np.pi
+        / 2,  # the geometric doppler is interpreted as radial motion, so azimuth angle component must result in value of 1 (i.e. pi/2)
+        degrees=False,
     )
     return data_cube
 
