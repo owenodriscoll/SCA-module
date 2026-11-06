@@ -127,8 +127,10 @@ def add_L1_uncertainties(
         Lambda: float, 
         grid_spacing_slant_range: float, 
         fixed_SCR: bool = None,
-        var_reference: str = "V_leakage_pulse_rg", 
-        interpolator: str = "linear", 
+        var_reference: str = "V_leakage_pulse_rg",
+        var_leakage: str = "V_leakage_pulse_rg",
+        var_inc: str = "inc_scat",
+        interpolator: str = "linear",
         random_state: int = 42,
 
         ):
@@ -141,8 +143,9 @@ def add_L1_uncertainties(
       overlapping with the echo of the other pulse from +- the pulse-pair offset. The received sample referenced to the second pulse
       gives the NRCS speckle, and the product of the two samples T_pp apart the pulse-pair noise
     - pulse-pair noise is returned as the real and imaginary part of that lag product, `pp_re` and `pp_im`, not as a velocity.
-      Low-pass filter these and only then derive V_pp and V_sigma with combine_pulse_pair, so that the products are summed
-      as by the processor (weighted by speckle and NRCS brightness, phases averaged on the circle)
+      The same lag product rotated by the leakage of its resolution cell is returned as `pp_re_sigma` and `pp_im_sigma`.
+      Optionally correct the leakage with correct_lag_product_leakage, low-pass filter, and only then derive V_pp and V_sigma with combine_pulse_pair,
+      so that the products are summed as by the processor (weighted by speckle and NRCS brightness, phases averaged on the circle)
 
     :param ds: xarray Dataset containing the observation data with all variables and coordinates
     :type ds: xr.Dataset
@@ -166,6 +169,10 @@ def add_L1_uncertainties(
     :type fixed_SCR: float | int
     :param var_reference: reference variable name for determining output shape, defaults to "V_leakage_pulse_rg"
     :type var_reference: str
+    :param var_leakage: leakage variable name (surface-projected velocity) that rotates the lag product, defaults to "V_leakage_pulse_rg"
+    :type var_leakage: str
+    :param var_inc: incidence angle variable name (in degrees) of the leakage, defaults to "inc_scat"
+    :type var_inc: str
     :param interpolator: interpolation method to use (e.g., 'linear'), defaults to "linear"
     :type interpolator: str
     :param random_state: random seed for reproducibility, defaults to 42
@@ -325,7 +332,22 @@ def add_L1_uncertainties(
     # Each product is weighted by its magnitude (speckle and NRCS brightness), and phases are averaged on the circle
     # The real and imaginary parts are stored; after low-pass filtering both, combine_pulse_pair takes the phase of the filtered product
     lag_product = np.conj(sample_A) * sample_B
-    lag_product = {"pp_re": lag_product.real, "pp_im": lag_product.imag}
+
+    # the leakage rotates the lag product of each resolution cell by its phase (same coarsening as P), before the Fourier interpolation
+    def resolution_cell_phase(V):
+        return (
+            velocity_to_lag_phase(V, data_cube_resamp[var_inc], Lambda=Lambda, T_pp=T_pp)
+            .transpose(*data_cube_resamp[var_reference].dims)
+            .coarsen({dim_range: 2}, boundary="trim")
+            .mean()
+            .data
+        )
+    lag_product_sigma = lag_product * np.exp(1j * resolution_cell_phase(data_cube_resamp[var_leakage]))
+
+    lag_product = {
+        "pp_re": lag_product.real, "pp_im": lag_product.imag,
+        "pp_re_sigma": lag_product_sigma.real, "pp_im_sigma": lag_product_sigma.imag,
+    }
     for name, component in lag_product.items():
         # replace nans and infs with zero to avoid issues with padding, a zero product does not contribute to the sum
         da_component = xr.where(np.isfinite(component), component, 0) * da_ones_independent_slant_range
@@ -335,6 +357,9 @@ def add_L1_uncertainties(
         if not fixed_SCR:
             # nan where the clutter (or the scene) is unknown, as gamma_SCR
             data_cube_resamp[name] = data_cube_resamp[name].where(data_cube_resamp["gamma_SCR"].notnull())
+        if name.endswith("_sigma"):
+            # nan where the leakage is unknown
+            data_cube_resamp[name] = data_cube_resamp[name].where(data_cube_resamp[var_leakage].notnull())
 
     return data_cube_resamp
 
@@ -508,6 +533,51 @@ def compute_lpf_cube(
         ds[name + "_lpf"] = (filtered[name] / weights[mask_of[name]]).where(complete[mask_of[name]])
     return ds
 
+def velocity_to_lag_phase(V, inc, Lambda, T_pp):
+    """
+    Phase of the lag product T_pp apart for a surface-projected velocity V, with the incidence angle inc in degrees.
+    The inverse of the conversion in combine_pulse_pair
+    """
+    return 2 * (2 * np.pi / Lambda) * T_pp * V * np.sin(np.radians(inc))
+
+def correct_lag_product_leakage(
+        ds,
+        Lambda,
+        T_pp,
+        var_inc = "inc_scat",
+    ):
+    """
+    Corrects the leakage in the lag product from add_L1_uncertainties (pp_re_sigma and pp_im_sigma, rotated by the true leakage
+    per resolution cell) by rotating it by minus the estimated leakage phase, giving pp_re_sigma_net and pp_im_sigma_net.
+
+    To be applied before low-pass filtering, so that the corrected products are summed as complex products, as by the processor.
+    The estimated leakage is V_leakage_pulse_rg - V_leakage_pulse_rg_net.
+    NOTE the correction is applied at the native ground-range sampling, as by a processor on its own samples
+
+    Input
+    -----
+    ds: xr.Dataset,
+        dataset containing "pp_re_sigma", "pp_im_sigma", "V_leakage_pulse_rg", "V_leakage_pulse_rg_net" and var_inc (in degrees)
+    Lambda: float,
+        radar wavelength, in meters
+    T_pp: float,
+        pulse-pair separation time, in seconds
+
+    Returns
+    -------
+    ds: xr.Dataset,
+        copy of the input with the corrected lag product added
+    """
+    ds = ds.copy()
+
+    lag_product = ds["pp_re_sigma"] + 1j * ds["pp_im_sigma"]
+    V_leakage_estimate = ds["V_leakage_pulse_rg"] - ds["V_leakage_pulse_rg_net"]
+    lag_product_corrected = lag_product * np.exp(-1j * velocity_to_lag_phase(V_leakage_estimate, ds[var_inc], Lambda=Lambda, T_pp=T_pp))
+    ds["pp_re_sigma_net"] = lag_product_corrected.real
+    ds["pp_im_sigma_net"] = lag_product_corrected.imag
+
+    return ds
+
 def combine_pulse_pair(
         ds,
         Lambda,
@@ -516,8 +586,9 @@ def combine_pulse_pair(
         var_inc = "inc_scat",
     ):
     """
-    Converts the pulse-pair lag product from add_L1_uncertainties into a surface-projected velocity error V_pp
-    and adds it to the leakage to obtain V_sigma (and V_sigma_net if the net leakage is present).
+    Converts the pulse-pair lag products into surface-projected velocities: V_pp from the lag product of add_L1_uncertainties
+    (pulse-pair noise only), and V_sigma from the one rotated by the leakage (the L1 error). V_sigma_net follows from
+    the leakage-corrected product of correct_lag_product_leakage, if present.
 
     To be applied after low-pass filtering: the phase is taken from the filtered lag product, so that resolved samples are
     summed as complex products (as by a pulse-pair processor) rather than averaged as wrapped phases. Use suffix = "" for the native-resolution fields and
@@ -526,8 +597,8 @@ def combine_pulse_pair(
     Input
     -----
     ds: xr.Dataset,
-        dataset containing f"pp_re{suffix}", f"pp_im{suffix}", f"V_leakage_pulse_rg{suffix}" and var_inc (in degrees),
-        and optionally f"V_leakage_pulse_rg_net{suffix}"
+        dataset containing f"pp_re{suffix}", f"pp_im{suffix}", f"pp_re_sigma{suffix}", f"pp_im_sigma{suffix}" and var_inc (in degrees),
+        and optionally the leakage-corrected f"pp_re_sigma_net{suffix}" and f"pp_im_sigma_net{suffix}"
     Lambda: float,
         radar wavelength, in meters
     T_pp: float,
@@ -542,16 +613,18 @@ def combine_pulse_pair(
     """
     ds = ds.copy()
 
-    phase = np.arctan2(ds[f"pp_im{suffix}"], ds[f"pp_re{suffix}"])
-    ds[f"V_pp{suffix}"] = phase2vel(
-        phase=phase,
-        wavenumber=2 * np.pi / Lambda,
-        T=T_pp
-    ) / np.sin(np.radians(ds[var_inc])) # surface projected
+    def lag_product_to_velocity(name):
+        phase = np.arctan2(ds[f"pp_im{name}{suffix}"], ds[f"pp_re{name}{suffix}"])
+        return phase2vel(
+            phase=phase,
+            wavenumber=2 * np.pi / Lambda,
+            T=T_pp
+        ) / np.sin(np.radians(ds[var_inc])) # surface projected
 
-    ds[f"V_sigma{suffix}"] = ds[f"V_leakage_pulse_rg{suffix}"] + ds[f"V_pp{suffix}"]
-    if f"V_leakage_pulse_rg_net{suffix}" in ds:
-        ds[f"V_sigma_net{suffix}"] = ds[f"V_leakage_pulse_rg_net{suffix}"] + ds[f"V_pp{suffix}"]
+    ds[f"V_pp{suffix}"] = lag_product_to_velocity("")
+    ds[f"V_sigma{suffix}"] = lag_product_to_velocity("_sigma")
+    if f"pp_re_sigma_net{suffix}" in ds:
+        ds[f"V_sigma_net{suffix}"] = lag_product_to_velocity("_sigma_net")
 
     return ds
 
