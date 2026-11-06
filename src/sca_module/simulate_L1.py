@@ -498,11 +498,12 @@ def compute_lpf_cube(
     weights = low_pass_filter_2D_dataset(xr.Dataset(masks), **kwargs)
 
     # fraction of valid samples within each cell's footprint, as a separable box average. It is nan where the box leaves the domain
+    # NOTE in float64: in float32 the rolling sums drift past many gaps, dropping fully covered cells just below the threshold
     complete = {key: True for key in masks}
     if min_footprint_coverage is not None:
         half_widths = [int(np.floor(resolution_product / 2 * fs)) for fs in (fs_x, fs_y)]
         for key, valid in masks.items():
-            coverage = valid
+            coverage = valid.astype("float64")
             for dim, half_width in zip(valid.dims, half_widths):
                 coverage = coverage.rolling({dim: 2 * half_width + 1}, center=True).mean()
             complete[key] = coverage >= min_footprint_coverage - 1e-6
