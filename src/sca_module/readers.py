@@ -2,6 +2,7 @@ import numpy as np
 import xarray as xr
 from scipy.interpolate import LinearNDInterpolator
 from scipy.spatial import cKDTree
+from stereoid.oceans.forward_models.cmod5n import cmod5n_forward, cmod5n_inverse as cmod5n_inverse_stereoid
 
 R_EARTH = 6371e3
 
@@ -229,3 +230,47 @@ def interpolate_woc_rvl_to_grid(files, latitude, longitude, variables, angular_v
         data[name] = (latitude.dims, values.reshape(latitude.shape))
 
     return data
+
+
+def cmod5n_inverse(nrcs, phi, theta, wind_min = 0.2, wind_max = 30, n_iterations = 30):
+    """
+    Inverts CMOD5.N for wind speed, given the wind direction relative to the look direction.
+    Wraps stereoid's cmod5n_inverse (a bisection from 10 m/s with an initial step of 10 m/s) and handles the cells it cannot:
+    nan NRCS would return ~30 m/s and non-positive (noise-subtracted) NRCS a negative wind.
+
+    NOTE stereoid's bisection cannot exceed 30 m/s, and CMOD5.N increases monotonically with wind speed only up to ~31 m/s (at 29-52 degrees incidence).
+    NRCS below CMOD5.N(wind_min) returns wind_min; NRCS above CMOD5.N(wind_max) and nan return nan
+
+    Parameters
+    ----------
+    nrcs: np.array,
+        normalized radar cross section, in linear units
+    phi: np.array,
+        wind direction relative to the look direction, in degrees: 0 when the wind blows towards the radar
+    theta: np.array,
+        incidence angle, in degrees
+    wind_min, wind_max: float,
+        bounds of the valid wind speed, in m/s. wind_max should not exceed 30 m/s
+    n_iterations: int,
+        number of bisection iterations passed to stereoid, 30 resolves the wind speed to ~1e-8 m/s
+
+    Returns
+    -------
+    wind: np.array,
+        (stress-)equivalent neutral wind speed, in m/s, with the shape of nrcs
+    """
+    nrcs, phi, theta = [np.asarray(x, dtype="float64") for x in np.broadcast_arrays(nrcs, phi, theta)]
+    shape = nrcs.shape
+    nrcs, phi, theta = nrcs.ravel(), phi.ravel(), theta.ravel()
+
+    # stereoid expects equal-size arrays without nans, so only the valid cells are inverted
+    valid = np.isfinite(nrcs) & np.isfinite(phi) & np.isfinite(theta)
+    wind = np.full(nrcs.shape, np.nan)
+    wind[valid] = cmod5n_inverse_stereoid(nrcs[valid], phi[valid], theta[valid], iterations=n_iterations)
+
+    sigma_min = np.where(valid, cmod5n_forward(np.full(nrcs.shape, float(wind_min)), phi, theta), np.nan)
+    sigma_max = np.where(valid, cmod5n_forward(np.full(nrcs.shape, float(wind_max)), phi, theta), np.nan)
+    wind = np.where(nrcs <= sigma_min, wind_min, wind)
+    wind = np.where(~valid | (nrcs > sigma_max), np.nan, wind)
+
+    return wind.reshape(shape)
