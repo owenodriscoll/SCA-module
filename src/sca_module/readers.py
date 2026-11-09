@@ -1,5 +1,7 @@
 import numpy as np
 import xarray as xr
+from scipy.interpolate import LinearNDInterpolator
+from scipy.spatial import cKDTree
 
 R_EARTH = 6371e3
 
@@ -144,5 +146,86 @@ def stitch_s1_grd(files, pol = "VV", spacing = 1000, pixel_spacing = 10):
     data = data.drop_vars(["line", "sample"], errors="ignore")
     data = data.interp(az=np.arange(0, az[-1], spacing), method="linear")
     data["land_mask"] = data["land_mask"] > 0
+
+    return data
+
+
+def interpolate_woc_rvl_to_grid(files, latitude, longitude, variables, angular_variables = (), max_distance = 1500):
+    """
+    Interpolates fields of the WOC Sentinel-1 RVL product (dimensions row, cell, swath) onto the positions of another grid.
+
+    Each sub-swath is interpolated on its own (linear, on a Delaunay triangulation of the RVL cell centres of all files), and target
+    points further than max_distance from that sub-swath's cell centres are left empty, so that the convex hull does not extend the sub-swath.
+    Where sub-swaths overlap their values are averaged. Angular variables are interpolated as unit vectors.
+    Fill values (-999, |x| > 1e30) are set to nan, also in latitude and longitude
+
+    Parameters
+    ----------
+    files: list[str],
+        RVL files, e.g. the consecutive files of one Sentinel-1 datatake
+    latitude, longitude: xr.DataArray,
+        positions of the target grid, in degrees
+    variables: list[str],
+        RVL variables to interpolate
+    angular_variables: list[str],
+        subset of variables that are angles in degrees (e.g. wind_direction, radial_direction)
+    max_distance: float,
+        largest distance between a target point and the nearest RVL cell centre, in meters
+
+    Returns
+    -------
+    data: xr.Dataset,
+        interpolated variables with the dimensions and coordinates of latitude
+    """
+    def clean(x):
+        x = np.asarray(x, dtype="float64")
+        return np.where((np.abs(x) > 1e30) | (x == -999), np.nan, x)
+
+    rvl = [xr.open_dataset(file) for file in files]
+    n_swath = rvl[0].sizes["swath"]
+
+    # local equirectangular projection, in meters, shared by source and target
+    lat0, lon0 = float(latitude.mean()), float(longitude.mean())
+    def project(lat, lon):
+        return np.stack([R_EARTH * np.radians(lon - lon0) * np.cos(np.radians(lat0)), R_EARTH * np.radians(lat - lat0)], axis=-1)
+    target = project(latitude.data.ravel(), longitude.data.ravel())
+
+    fields = {}
+    for name in variables:
+        if name in angular_variables:
+            fields[name + "_cos"], fields[name + "_sin"] = [], []
+        else:
+            fields[name] = []
+
+    for swath in range(n_swath):
+        lat = np.concatenate([clean(d["lat"].isel(swath=swath)).ravel() for d in rvl])
+        lon = np.concatenate([clean(d["lon"].isel(swath=swath)).ravel() for d in rvl])
+        valid = np.isfinite(lat) & np.isfinite(lon)
+        points = project(lat[valid], lon[valid])
+
+        values = {}
+        for name in variables:
+            x = np.concatenate([clean(d[name].isel(swath=swath).squeeze()).ravel() for d in rvl])[valid]
+            if name in angular_variables:
+                values[name + "_cos"], values[name + "_sin"] = np.cos(np.radians(x)), np.sin(np.radians(x))
+            else:
+                values[name] = x
+
+        interpolator = LinearNDInterpolator(points, np.stack(list(values.values()), axis=-1))
+        result = interpolator(target)
+        distance, _ = cKDTree(points).query(target)
+        result[distance > max_distance] = np.nan
+        for i, name in enumerate(values):
+            fields[name].append(result[:, i])
+
+    data = xr.Dataset(coords=latitude.coords)
+    for name in variables:
+        if name in angular_variables:
+            c = np.nanmean(fields[name + "_cos"], axis=0)
+            s = np.nanmean(fields[name + "_sin"], axis=0)
+            values = np.degrees(np.arctan2(s, c)) % 360
+        else:
+            values = np.nanmean(fields[name], axis=0)
+        data[name] = (latitude.dims, values.reshape(latitude.shape))
 
     return data
