@@ -17,7 +17,8 @@ class DopSCAConfig:
     # -- System Details
     f0: float = 5.405e9  # Carrier frequency [Hz], Hoogeboom et al. (2018)
     z0: float = 823e3    # Satellite altitude [m], 823-848 km, Fois et al. (2015)
-    vx_sat: int = 7500   # Satellite velocity [m/s], Hoogeboom et al. (2018)
+    v_sat_orbit: int = 7000    # Satellite velocity used for Doppler (geometric Doppler/leakage, Doppler decorrelation) [m/s]
+    v_sat_ground: int = 6800   # Ground-track satellite velocity, sets the along-track pulse spacing [m/s], Hoogeboom et al. (2018)
     
     # -- Pulse Details
     PRF: int = 2                    # Pulse Repetition Frequency per antenna, Hoogeboom et al. (2018)
@@ -31,7 +32,7 @@ class DopSCAConfig:
     grg_min: float = 550E3                          # Minimum ground range [m] (within range main lobe)
     grid_spacing_target: int = 1000                 # Target grid spacing [m] SWB simulations are loaded on a 1 km grid, 
                                                     #here you can potentially oversample to avoid aliasing in azimuth
-    grid_spacing_slant_range_SCA: float = 75        # Slant range resolution [m]
+    grid_spacing_slant_range_SCA: float = 75        # Slant range spacing [m]
     az_footprint_cutoff: int = 80_000               # Azimuth footprint cutoff [m]
     resolution_product: int = 50_000                # Product resolution [m], Hoogeboom et al. (2018)
     product_averaging_window: str = "hann"          # Averaging window type
@@ -75,7 +76,7 @@ class DopSCAConfig:
         Ideally the new gridspacing should be a multiple of the stallite velocity divided by the PRF, which is the distance between pulse centers.
 
         """
-        new_grid_spacing = self.vx_sat / self.PRF / magic_divider
+        new_grid_spacing = self.v_sat_ground / self.PRF / magic_divider
         if new_grid_spacing != int(new_grid_spacing):
             warnings.warn("New grid spacing is not an integer, which may cause issues with interpolation. Consider adjusting magic_divider to achieve an integer grid spacing.")
         return new_grid_spacing
@@ -87,7 +88,8 @@ class DopSCAConfig:
             # System details
             'f0': cls.f0,
             'z0': cls.z0,
-            'vx_sat': cls.vx_sat,
+            'v_sat_orbit': cls.v_sat_orbit,
+            'v_sat_ground': cls.v_sat_ground,
             # Pulse details
             'PRF': cls.PRF,
             'SNR': cls.SNR,

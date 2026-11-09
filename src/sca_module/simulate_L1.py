@@ -6,16 +6,16 @@ from drama.performance.sar.antenna_patterns import sinc_bp, phased_array
 from leakage.misc import calculate_distance
 from leakage.utils import mean_along_azimuth
 from leakage.low_pass_filter import low_pass_filter_2D_dataset
-from leakage.conversions import dB, phase2vel, dop2vel, vel2dop, slant2ground
+from leakage.conversions import phase2vel, dop2vel, vel2dop, slant2ground
 from leakage.frequency_domain_padding import padding_fourier, da_integer_oversample_like, compute_padding_1D
-from leakage.uncertainties import decorrelation, pulse_pair_coherence, generate_complex_speckle, speckle_intensity, phase_error_generator, speckle_coherence, phase_error_generator_2D, generate_correlated_complex_speckle
+from leakage.uncertainties import decorrelation, pulse_pair_coherence, generate_complex_speckle, speckle_intensity, speckle_coherence
 
 
 def create_observation_cube(
         ds, 
         az_footprint_cutoff, 
-        grid_spacing, 
-        vx_sat, 
+        grid_spacing,
+        v_sat_ground,
         PRF,
         dim_original = "grg",
         dim_filter = "az",
@@ -26,13 +26,14 @@ def create_observation_cube(
     """
     Function to remove data outside beam pattern footprint.
     Creates a new stack of (potentially overlapping) observations centered on a new azimuthmul coordinate system
+    The along-track spacing of the observations (stride) is v_sat_ground / PRF, with v_sat_ground the ground-track velocity
 
     NOTE does not work for squinted geometries
     """
 
     window_size = np.round(az_footprint_cutoff / grid_spacing).astype("int")
-    stride = vx_sat / PRF
-    stride_elements = np.round(vx_sat / PRF / grid_spacing).astype("int")
+    stride = v_sat_ground / PRF
+    stride_elements = np.round(v_sat_ground / PRF / grid_spacing).astype("int")
 
     data = ds.copy()
 
@@ -69,16 +70,18 @@ def create_observation_cube(
 
     return data
 
-def compute_beam_pattern(az_angle_wrt_boresight: np.array, grg_angle_wrt_boresight: np.array, antenna_elements: int, antenna_weighting: float, antenna_length: float, antenna_height: float, f0: float, beam_pattern: str):
+def compute_beam_pattern(az_angle_wrt_boresight_slant: np.array, grg_angle_wrt_boresight: np.array, antenna_elements: int, antenna_weighting: float, antenna_length: float, antenna_height: float, f0: float, beam_pattern: str):
     """
     Computes a beam pattern to be applied along the entire dataset.
-    # NOTE The following computations are directly computed, a delayed lazy computation may be better
+    # NOTE The following computations are directly computed, a delayed lazy computation may be more efficient
     # NOTE Currently tapering only azimuth
     # NOTE Same beam pattern assumed for transmit and receive
     # NOTE Beam patterns are already in intensity, square is only needed for two-way pattern
 
     Input
     -----
+    az_angle_wrt_boresight_slant: np.array;
+        azimuth angle w.r.t. boresight in the slant plane (antenna frame), in radians, i.e. arcsin(az / slant range)
     antenna_elements int; 
         number of anetenna elements that are considered in beam tapering, only affects when beam pattern = phased_array
     antenna_weighting: 
@@ -88,14 +91,14 @@ def compute_beam_pattern(az_angle_wrt_boresight: np.array, grg_angle_wrt_boresig
     # Assumes same pattern on transmit and receive
     if beam_pattern == "sinc":
         beam_az = sinc_bp(
-            sin_angle=np.sin(az_angle_wrt_boresight),
+            sin_angle=np.sin(az_angle_wrt_boresight_slant),
             L=antenna_length,
             f0=f0,
         )
         
     elif beam_pattern == "phased_array":
         beam_az = phased_array(
-            sin_angle=np.sin(az_angle_wrt_boresight),
+            sin_angle=np.sin(az_angle_wrt_boresight_slant),
             L=antenna_length,
             f0=f0,
             N=antenna_elements,
@@ -116,16 +119,19 @@ def compute_beam_pattern(az_angle_wrt_boresight: np.array, grg_angle_wrt_boresig
 def add_L1_uncertainties(
         ds: xr.Dataset, 
         dim_range: str, 
-        dim_az_beam: str, 
-        vx_sat: float|int, 
-        U: float|int, 
+        dim_az_beam: str,
+        v_sat_orbit: float|int,
+        U: float|int,
         sat_height: float|int, 
         T_pp: float|int, 
         Lambda: float, 
         grid_spacing_slant_range: float, 
         fixed_SCR: bool = None,
-        var_reference: str = "V_leakage_pulse_rg", 
-        interpolator: str = "linear", 
+        var_reference: str = "V_leakage_pulse_rg",
+        var_leakage: str = "V_leakage_pulse_rg",
+        var_signal: str = "V_pulse_rg",
+        var_inc: str = "inc_scat",
+        interpolator: str = "linear",
         random_state: int = 42,
 
         ):
@@ -134,6 +140,15 @@ def add_L1_uncertainties(
     - first the data is interpolated to a slant-range spacing defined by the resolution (e.g. 150 m slant range resolution is 75m slant range grid)
     - then pulse-pair noise and speckle are generated per resolution cell, i.e. one noise sample per two grid cells
     - using zero-padding in the Fourier domain this is interpolated to noise/speckle at a 75 m spacing
+    - the echoes of both pulses are simulated per resolution cell (same scatterers, decorrelated by surface and platform motion),
+      overlapping with the echo of the other pulse from +- the pulse-pair offset. The received sample referenced to the second pulse
+      gives the NRCS speckle, and the product of the two samples T_pp apart the pulse-pair noise
+    - pulse-pair noise is returned as the real and imaginary part of that lag product, `pp_re` and `pp_im`, not as a velocity.
+      The same lag product rotated by the leakage of its resolution cell is returned as `pp_re_sigma` and `pp_im_sigma`,
+      and rotated by the leakage and the geophysical signal as `pp_re_signal_and_sigma` and `pp_im_signal_and_sigma`.
+      Optionally correct the leakage with correct_lag_product_leakage, low-pass filter, and only then derive V_pp, V_sigma and
+      V_signal_and_sigma with combine_pulse_pair,
+      so that the products are summed as by the processor (weighted by speckle and NRCS brightness, phases averaged on the circle)
 
     :param ds: xarray Dataset containing the observation data with all variables and coordinates
     :type ds: xr.Dataset
@@ -141,8 +156,8 @@ def add_L1_uncertainties(
     :type dim_range: str
     :param dim_az_beam: name of the azimuth beam dimension
     :type dim_az_beam: str
-    :param vx_sat: satellite velocity in m/s
-    :type vx_sat: float | int
+    :param v_sat_orbit: satellite velocity used for Doppler in m/s, sets the Doppler decorrelation time
+    :type v_sat_orbit: float | int
     :param U: surface wind speed in m/s used for correlation time computation
     :type U: float | int
     :param sat_height: satellite altitude/height in meters
@@ -157,6 +172,12 @@ def add_L1_uncertainties(
     :type fixed_SCR: float | int
     :param var_reference: reference variable name for determining output shape, defaults to "V_leakage_pulse_rg"
     :type var_reference: str
+    :param var_leakage: leakage variable name (surface-projected velocity) that rotates the lag product, defaults to "V_leakage_pulse_rg"
+    :type var_leakage: str
+    :param var_signal: geophysical signal variable name (surface-projected velocity) that also rotates `pp_*_signal_and_sigma`, defaults to "V_pulse_rg"
+    :type var_signal: str
+    :param var_inc: incidence angle variable name (in degrees) of the leakage and signal, defaults to "inc_scat"
+    :type var_inc: str
     :param interpolator: interpolation method to use (e.g., 'linear'), defaults to "linear"
     :type interpolator: str
     :param random_state: random seed for reproducibility, defaults to 42
@@ -204,141 +225,151 @@ def add_L1_uncertainties(
     )
 
     # ----------------------------
-    # ---- Compute coehrences ----
+    # ---- Compute coherences ----
     # ----------------------------
     # calculates average azimuthal beam standard deviation within -3 dB
-    beam_db = dB(data_cube_resamp.beam)
+    # NOTE samples where the beam is unknown (nan, e.g. beyond the extent of the beam pattern) count as outside the -3 dB beam
+    beam = data_cube_resamp.beam
     beam_3dB = (
-        xr.where((beam_db - beam_db.max(dim=dim_az_beam)) < -3, np.nan, 1)
-        * data_cube_resamp.az_angle_wrt_boresight # in radians
+        xr.where(beam >= 10 ** (-3 / 10) * beam.max(dim=dim_az_beam), 1, np.nan)
+        * data_cube_resamp.az_angle_wrt_boresight_slant # in radians, antenna-frame angle
     )
+
+    # NOTE maybe this needs to be power weighted
     sigma_az_angle = beam_3dB.std(dim=dim_az_beam).mean().values * 1
     # print(sigma_az_angle)
 
     wavenumber = 2 * np.pi / Lambda
     # NOTE assumes a single represenative sigma_az_angle over the entire range extent.
     # When simulating the full range-extent, a range-varying sigma_az_angle would likely be more suitable.
-    T_corr_Doppler = 1 / (np.sqrt(2) * wavenumber * vx_sat * sigma_az_angle)  
+    T_corr_Doppler = 1 / (np.sqrt(2) * wavenumber * v_sat_orbit * sigma_az_angle)
     T_corr_surface = 3.29 * Lambda / U
+
+    # -------------------------------------
+    # ---- pulse-pair echo overlap ----
+    # -------------------------------------
+    # the echoes of both pulses overlap: with time referenced to the first pulse, range cell r also receives the echo of the second pulse from r - offset, and the sample T_pp later the echo of the first pulse from r + offset
+    # NOTE divided by two for two way travel time
+    pulse_pair_slant_range_offset = T_pp * scipy.constants.c / 2
+    # data_cube_resamp is uniform in slant range, so the offset is an integer number of samples (rounding error ~10 m)
+    offset_samples = int(np.round(pulse_pair_slant_range_offset / grid_spacing_slant_range))
+
+    # NOTE the clutter is unknown where r -+ offset falls outside the scene: these cells are nan (one offset at either edge)
+    nrcs_scat = data_cube_resamp['nrcs_scat']
+    nrcs_scat_near = nrcs_scat.shift({dim_range: offset_samples})   # at r - offset
+    nrcs_scat_far = nrcs_scat.shift({dim_range: -offset_samples})   # at r + offset
+
+    # signal-to-clutter coherence from expected (speckle-free) powers: of the two samples T_pp apart only the echoes from r are
+    # correlated, the clutter comes from r - offset in one and from r + offset in the other. Equals SCR / (1 + SCR) = 0.5 for uniform NRCS
+    data_cube_resamp["gamma_SCR"] = nrcs_scat / np.sqrt((nrcs_scat + nrcs_scat_near) * (nrcs_scat + nrcs_scat_far))
+
+    # ---------------------------------------------------
+    # ---- echoes and received samples per resolution cell ----
+    # ---------------------------------------------------
+    if fixed_SCR:
+        # uniform scene: unit-power speckle, coherence of the pair imposed directly
+        speckle_c = generate_complex_speckle(da_ones_independent_slant_range.shape, random_state=random_state)
+        gamma = pulse_pair_coherence(T_pp=T_pp, T_corr_surface=T_corr_surface, T_corr_Doppler=T_corr_Doppler, SNR=fixed_SCR)
+        u_1, u_2 = generate_complex_speckle((2, *da_ones_independent_slant_range.shape), random_state=random_state + 2)
+        sample_A, sample_B = u_1, gamma * u_1 + np.sqrt(1 - gamma**2) * u_2
+    else:
+        # expected power per resolution cell, positionally aligned with da_ones_independent_slant_range (same coarsening)
+        P = (
+            nrcs_scat.transpose(*data_cube_resamp[var_reference].dims)
+            .coarsen({dim_range: 2}, boundary="trim")
+            .mean()
+            .data
+        )
+        P = np.moveaxis(P, dim_to_pad, -1)  # range last for shifting
+        n = int(np.round(offset_samples / 2))
+
+        def shift_range(x, k):
+            """x at r - k along the last axis, nan where r - k falls outside the swath"""
+            out = np.full_like(x, np.nan)
+            if k > 0:
+                out[..., k:] = x[..., :-k]
+            else:
+                out[..., :k] = x[..., -k:]
+            return out
+
+        # each pulse carries half the power; the second pulse sees the same scatterers, decorrelated by surface and platform motion
+        gamma_speckle = speckle_coherence(T_pp=T_pp, T_corr_surface=T_corr_surface, T_corr_Doppler=T_corr_Doppler)
+        u_echo, u_new = generate_complex_speckle((2, *P.shape), random_state=random_state)
+        echo_1 = np.sqrt(P / 2) * u_echo
+        echo_2 = np.sqrt(P / 2) * (gamma_speckle * u_echo + np.sqrt(1 - gamma_speckle**2) * u_new)
+
+        # clutter: echo of the second pulse from r - offset and of the first pulse from r + offset
+        # NOTE where r -+ offset falls outside the scene (or the scene is undefined) the clutter is unknown and the sample is nan, as gamma_SCR
+        clutter_near = shift_range(echo_2, n)
+        clutter_far = shift_range(echo_1, -n)
+        P_far = shift_range(P, -n)
+
+        # received samples T_pp apart, range referenced to the second pulse: sample B is also the detected NRCS sample
+        sample_A = echo_1 + clutter_near
+        sample_B = echo_2 + clutter_far
+
+        # unit-power speckle of sample B, so that NRCS speckle and pulse-pair noise come from the same echoes
+        speckle_c = sample_B / np.sqrt((P + P_far) / 2)
+        speckle_c = np.where(np.isfinite(speckle_c), speckle_c, u_echo)  # nan cells: any unit speckle keeps the padding finite, the NRCS is nan there anyway
+        speckle_c, sample_A, sample_B = [np.moveaxis(s, -1, dim_to_pad) for s in (speckle_c, sample_A, sample_B)]
 
     # ------------------------
     # ---- adding speckle ----
     # ------------------------
-    gamma_speckle = speckle_coherence(
-        T_pp=T_pp,
-        T_corr_surface=T_corr_surface,
-        T_corr_Doppler=T_corr_Doppler,
-    )
-
-    # compute speckle for the first pulse
-    speckle_c = generate_complex_speckle(
-        da_ones_independent_slant_range.shape, random_state=random_state
-    )
-
-    # speckle for the second pulse is correlated to the first, we must use a different random state for the uncorrelated part
-    speckle_c_displaced = generate_correlated_complex_speckle(speckle_c, correlation=gamma_speckle, random_state=random_state+1)
-
     da_speckle_c = speckle_c * da_ones_independent_slant_range
-    da_speckle_c_displaced = speckle_c_displaced * da_ones_independent_slant_range
     da_speckle_c_padded = padding_fourier(da_speckle_c, padding=(pad, pad), dimension=dim_to_pad_name)
-    da_speckle_c_displaced_padded = padding_fourier(da_speckle_c_displaced, padding=(pad, pad), dimension=dim_to_pad_name)
 
     # since iid noise, we can clip time domain to correct dimensions without affecting statistics
     shape_ref = data_cube_resamp[var_reference].shape
     da_speckle_c_padded_cut = da_speckle_c_padded[: shape_ref[0], : shape_ref[1]]
-    da_speckle_c_displaced_padded_cut = da_speckle_c_displaced_padded[: shape_ref[0], : shape_ref[1]]
-
     speckle = speckle_intensity(da_speckle_c_padded_cut)
-    speckle_displaced = speckle_intensity(da_speckle_c_displaced_padded_cut)
-    nrcs_pulse_1 = data_cube_resamp['nrcs_scat'] * speckle.data
-    nrcs_pulse_2 = data_cube_resamp['nrcs_scat'] * speckle_displaced.data
 
-    # displace the second pulse down slant range and interpolate back to grid spacing
-    # NOTE divided by two for two way travel time
-    pulse_pair_slant_range_offset = T_pp * scipy.constants.c / 2
-    nrcs_pulse_2 = nrcs_pulse_2.assign_coords(grg = data_cube_resamp.grg - pulse_pair_slant_range_offset).interp(grg = data_cube_resamp.grg)
-
-    # add both pulses together
-    # NOTE divided by two to keep power the same
-    data_cube_resamp["nrcs_scat_speckle_pulse_1"] = nrcs_pulse_1 / 2
-    data_cube_resamp["nrcs_scat_speckle_pulse_2"] = nrcs_pulse_2 / 2
-    data_cube_resamp["nrcs_scat_speckle"] = (nrcs_pulse_1 + nrcs_pulse_2)/2
-
-    # re-interpolate to higher sampling to maintain uniform ground samples
+    # each pulse carries half the power. The overlapping echoes add as complex fields before detection,
+    # so a single (single-look) speckle realisation applies to their combined power
+    # range referenced to the second pulse: cell r holds the echo of the second pulse from r and of the first pulse from r + offset
+    # NOTE assumes one detected sample per range cell.
+    data_cube_resamp["nrcs_scat_speckle"] = (nrcs_scat + nrcs_scat_far) / 2 * speckle.data
     data_cube_resamp = data_cube_resamp.astype("float32")
 
     # -------------------------------
     # ---- Pulse-pair uncertaity ----
     # -------------------------------
-    # # NOTE assumes no squint
-    # gamma_velocity = decorrelation(
-    # T_pp, T_corr_Doppler
-    # )  # eq 6 & 7 Rodriguez (2018), NOTE not valid for squint NOTE assumes Gaussian beam pattern
-    # gamma_temporal = decorrelation(T_pp, T_corr_surface)
-    # print("gamma D:", gamma_velocity)
-    # print("gamma TW:", gamma_temporal)
+    # Each product is weighted by its magnitude (speckle and NRCS brightness), and phases are averaged on the circle
+    # The real and imaginary parts are stored; after low-pass filtering both, combine_pulse_pair takes the phase of the filtered product
+    lag_product = np.conj(sample_A) * sample_B
 
-    if fixed_SCR:
-        gamma = pulse_pair_coherence(
-            T_pp=T_pp,
-            T_corr_surface=T_corr_surface,
-            T_corr_Doppler=T_corr_Doppler,
-            SNR=fixed_SCR
+    # the leakage (and the geophysical signal) rotate the lag product of each resolution cell by their phase (same coarsening as P),
+    # before the Fourier interpolation
+    def resolution_cell_phase(V):
+        return (
+            velocity_to_lag_phase(V, data_cube_resamp[var_inc], Lambda=Lambda, T_pp=T_pp)
+            .transpose(*data_cube_resamp[var_reference].dims)
+            .coarsen({dim_range: 2}, boundary="trim")
+            .mean()
+            .data
         )
-        # gamma_sncr = (fixed_SCR / (1 + fixed_SCR))
-        # print("gamma SNR:", gamma_sncr)
-        # print("gamma (mean):", gamma)
+    lag_product_sigma = lag_product * np.exp(1j * resolution_cell_phase(data_cube_resamp[var_leakage]))
+    lag_product_signal_and_sigma = lag_product * np.exp(1j * resolution_cell_phase(data_cube_resamp[var_leakage] + data_cube_resamp[var_signal]))
 
-        phase_uncertainty = phase_error_generator(
-            gamma=gamma,
-            n_samples=(da_ones_independent_slant_range.shape),
-            random_state=random_state,
-        )
-    
-    elif not fixed_SCR:
-
-        temp_independent_slant_range = np.linspace(data_cube_resamp[dim_range].min(), data_cube_resamp[dim_range].max(), da_ones_independent_slant_range.sizes[dim_to_pad_name])
-        SNR_2D = (data_cube_resamp.nrcs_scat_speckle_pulse_2 / data_cube_resamp.nrcs_scat_speckle_pulse_1).interp({dim_range:temp_independent_slant_range}, method=interpolator)
-
-        gamma = pulse_pair_coherence(
-            T_pp=T_pp,
-            T_corr_surface=T_corr_surface,
-            T_corr_Doppler=T_corr_Doppler,
-            SNR=SNR_2D
-        )
-        # gamma_sncr = (SNR_2D / (1 + SNR_2D)).mean().values
-        # print("gamma SNR:", gamma_sncr)
-        # print("gamma (mean):", gamma.mean().values)
-
-        # here we use a different random state again, to avoid some artifical correlation with speckle
-        phase_uncertainty = phase_error_generator_2D(gamma.data, theta=0, random_state=random_state + 2, n_bins=1001)
-        # phase_uncertainty = phase_error_generator_2D(gamma_2D.data/gamma_2D.data * 0.75, theta=0, random_state=random_state + 2, n_bins=1001)
-    else: 
-        raise ValueError("fixed_SCR must be either True or False")
-
-    velocity_error = phase2vel(
-        phase=phase_uncertainty, 
-        wavenumber=wavenumber,
-        T=T_pp
-    )
-    
-    da_V_pp = velocity_error * da_ones_independent_slant_range
-
-    # replace nans and infs with zero to avoid issues with padding, these will be ignored in the final product as they correspond to areas with no data
-    da_V_pp = xr.where(np.isfinite(da_V_pp), x = da_V_pp, y = 0) 
-    V_pp_c = padding_fourier(da_V_pp, padding=(pad, pad), dimension=dim_to_pad_name)
-    V_pp = V_pp_c[: shape_ref[0], : shape_ref[1]]
-    V_pp = V_pp.real # NOTE if complex part is not negligible this will slightly underestimate pulsepair noise
-
-    # here we add pulse-pair uncertainty and convert it to surface projected velocity
-    data_cube_resamp["V_pp"] = (
-        xr.zeros_like(data_cube_resamp["V_leakage_pulse_rg"]) + V_pp.data
-    ) / np.sin(np.radians(data_cube_resamp["inc_scat"])) # in radians
-
-    # combine pulse-pair ucnertainty with leakage for total V_sigma
-    data_cube_resamp["V_sigma"] = (
-        data_cube_resamp["V_leakage_pulse_rg"] + data_cube_resamp["V_pp"]
-    )
+    lag_product = {
+        "pp_re": lag_product.real, "pp_im": lag_product.imag,
+        "pp_re_sigma": lag_product_sigma.real, "pp_im_sigma": lag_product_sigma.imag,
+        "pp_re_signal_and_sigma": lag_product_signal_and_sigma.real, "pp_im_signal_and_sigma": lag_product_signal_and_sigma.imag,
+    }
+    for name, component in lag_product.items():
+        # replace nans and infs with zero to avoid issues with padding, a zero product does not contribute to the sum
+        da_component = xr.where(np.isfinite(component), component, 0) * da_ones_independent_slant_range
+        component_c = padding_fourier(da_component, padding=(pad, pad), dimension=dim_to_pad_name)
+        component_c = component_c[: shape_ref[0], : shape_ref[1]].real # NOTE if complex part is not negligible this will slightly underestimate pulsepair noise
+        data_cube_resamp[name] = xr.zeros_like(data_cube_resamp[var_reference]) + component_c.data
+        if not fixed_SCR:
+            # nan where the clutter (or the scene) is unknown, as gamma_SCR
+            data_cube_resamp[name] = data_cube_resamp[name].where(data_cube_resamp["gamma_SCR"].notnull())
+        if name.endswith("_sigma"):
+            # nan where the leakage (or the signal) is unknown
+            data_cube_resamp[name] = data_cube_resamp[name].where(data_cube_resamp[var_leakage].notnull())
+        if name.endswith("_signal_and_sigma"):
+            data_cube_resamp[name] = data_cube_resamp[name].where(data_cube_resamp[var_signal].notnull())
 
     return data_cube_resamp
 
@@ -352,9 +383,19 @@ def compute_cube_observation_geometry(ds_cube, dim_az_beam, dim_az_slow_time, di
             x=data_cube["distance_ground"], y=sat_height
         )
 
-    data_cube["az_angle_wrt_boresight"] = np.arcsin(
+    # azimuth angle in the slant plane (antenna frame): sin = az / slant range
+    # use for the antenna beam pattern and the beam's angular spread (Doppler decorrelation time)
+    # NOTE its sine already is the projection of the along-track direction onto the line of sight,
+    # so it must not be combined with an additional sin(incidence) when computing Doppler
+    data_cube["az_angle_wrt_boresight_slant"] = np.arcsin(
         (data_cube[dim_az_beam]) / data_cube["distance_slant_range"]
         ) # NOTE arcsin instead of tan as distance_slant_range includes azimuthal angle
+
+    # azimuth angle in the ground plane: sin = az / ground distance
+    # use with vel2dop, which itself projects from the ground plane onto the line of sight via sin(incidence)
+    data_cube["az_angle_wrt_boresight_ground"] = np.arcsin(
+        (data_cube[dim_az_beam]) / data_cube["distance_ground"]
+        )
 
     data_cube["grg_angle_wrt_boresight"] = np.deg2rad(
         data_cube[var_inc] - boresight_elevation_angle_scat
@@ -362,8 +403,20 @@ def compute_cube_observation_geometry(ds_cube, dim_az_beam, dim_az_slow_time, di
     
     return data_cube
 
-def compute_true_observations(ds_cube, var_nrcs, var_inc, dim_az_beam, vx_sat, Lambda, var_azimuth_angle_wrt_boresight: str = "az_angle_wrt_boresight"):
+def compute_observations(ds_cube, var_nrcs, var_inc, dim_az_beam, v_sat_orbit, Lambda, T_pp, var_azimuth_angle_wrt_boresight: str = "az_angle_wrt_boresight_ground"):
+    """
+    Integrates NRCS, Doppler and the geometric Doppler (leakage) over the azimuth beam.
+    v_sat_orbit is the satellite velocity used for the geometric Doppler.
+
+    The leakage is the phase of the beam-integrated lag product: each azimuth sample rotates its share of the lag product
+    by its geometric Doppler phase over T_pp, and the pulse pair measures the phase of the sum. This differs from the
+    power-weighted mean geometric Doppler by the odd higher-order cumulants (skewness) of the weighted Doppler spectrum
+
+    NOTE where the azimuth window extends beyond the beam pattern the beam is unknown (nan). These samples are given zero gain,
+    i.e. they are ignored in the beam integrals
+    """
     data_cube = ds_cube.copy()
+    data_cube["beam"] = data_cube["beam"].fillna(0)
 
     data_cube["beam_weight"] = data_cube["beam"] / mean_along_azimuth(
         data_cube["beam"], 
@@ -382,36 +435,13 @@ def compute_true_observations(ds_cube, var_nrcs, var_inc, dim_az_beam, vx_sat, L
     )
 
     data_cube["dop_geom"] = vel2dop(
-        velocity=vx_sat,
+        velocity=v_sat_orbit,
         Lambda=Lambda,
         angle_incidence=np.radians(data_cube[var_inc]),  # NOTE assumes flat Earth
+        # NOTE vel2dop expects the ground-plane azimuth angle; passing the slant-plane angle applies sin(incidence) twice
+        # NOTE var_inc is the zero-Doppler incidence, not the local incidence at each az_beam offset;
+        # NOTE assumes a zero Doppler centroid at boresight (no Earth-rotation or attitude residual): the geometric Doppler is zero at az_beam = 0
         angle_azimuth=data_cube[var_azimuth_angle_wrt_boresight],
-        degrees=False,
-    )
-
-    data_cube["dop_geom_beam_weighted"] = (
-        data_cube["dop_geom"] * data_cube["weight"]
-    ) 
-    data_cube["dop_beam_weighted"] = (
-        data_cube["dop"] * data_cube["weight"]
-    )
-
-    # beam and backscatter weighted geometric Doppler is interpreted as geophysical Doppler, i.e. Leakage
-    data_cube["V_leakage"] = dop2vel(
-        Doppler=data_cube["dop_geom_beam_weighted"],
-        Lambda=Lambda,
-        angle_incidence=np.radians(data_cube[var_inc]),
-        angle_azimuth=np.pi
-        / 2,  # the geometric doppler is interpreted as radial motion, so azimuth angle component must result in value of 1 (i.e. pi/2)
-        degrees=False,
-    )
-
-    data_cube["V"] = dop2vel(
-        Doppler=data_cube["dop_beam_weighted"],
-        Lambda=Lambda,
-        angle_incidence=np.radians(data_cube[var_inc]),
-        angle_azimuth=np.pi
-        / 2,  # the geometric doppler is interpreted as radial motion, so azimuth angle component must result in value of 1 (i.e. pi/2)
         degrees=False,
     )
 
@@ -421,10 +451,38 @@ def compute_true_observations(ds_cube, var_nrcs, var_inc, dim_az_beam, vx_sat, L
         azimuth_dim = dim_az_beam
     )
 
-    # integrate Doppler and leakage over beam
-    data_cube[["dop_geom_pulse_rg", "V_leakage_pulse_rg", "dop_pulse_rg", "V_pulse_rg"]] = mean_along_azimuth(
-        data_cube[["dop_geom_beam_weighted", "V_leakage", "dop_beam_weighted", "V"]], 
+    # beam and backscatter weighted lag product of the geometric Doppler. Its phase is interpreted as geophysical Doppler, i.e. Leakage
+    lag_product_geom = mean_along_azimuth(
+        data_cube["weight"] * np.exp(1j * 2 * np.pi * T_pp * data_cube["dop_geom"]),
         azimuth_dim = dim_az_beam
+    )
+    data_cube["dop_geom_pulse_rg"] = np.arctan2(lag_product_geom.imag, lag_product_geom.real) / (2 * np.pi * T_pp)
+    data_cube["V_leakage_pulse_rg"] = dop2vel(
+        Doppler=data_cube["dop_geom_pulse_rg"],
+        Lambda=Lambda,
+        angle_incidence=np.radians(data_cube["inc_scat"]),
+        angle_azimuth=np.pi
+        / 2,  # the geometric doppler is interpreted as radial motion, so azimuth angle component must result in value of 1 (i.e. pi/2)
+        degrees=False,
+    )
+
+    # the geophysical Doppler rotates each scatterer on top of its geometric Doppler, so it is integrated over the beam from the
+    # lag product of both: the total phase minus the leakage. Weighting the geophysical Doppler on its own would ignore that scatterers
+    # whose geometric phase points away from the sum turn it less, or the opposite way
+    lag_product_total = mean_along_azimuth(
+        data_cube["weight"] * np.exp(1j * 2 * np.pi * T_pp * (data_cube["dop_geom"] + data_cube["dop"])),
+        azimuth_dim = dim_az_beam
+    )
+    # phase of the total relative to the leakage, taken in one step so that it cannot wrap
+    lag_product_signal = lag_product_total * np.conj(lag_product_geom)
+    data_cube["dop_pulse_rg"] = np.arctan2(lag_product_signal.imag, lag_product_signal.real) / (2 * np.pi * T_pp)
+    data_cube["V_pulse_rg"] = dop2vel(
+        Doppler=data_cube["dop_pulse_rg"],
+        Lambda=Lambda,
+        angle_incidence=np.radians(data_cube["inc_scat"]),
+        angle_azimuth=np.pi
+        / 2,  # the geophysical doppler is interpreted as radial motion, so azimuth angle component must result in value of 1 (i.e. pi/2)
+        degrees=False,
     )
     return data_cube
 
@@ -436,14 +494,20 @@ def compute_lpf_cube(
         data_2_lpf,
         window = 'hann',
         crop_edges = False,
+        min_footprint_coverage = None,
     ):
+    """
+    Low-pass filters the variables in data_2_lpf to the product resolution, adding them as f"{name}_lpf".
 
-    data_lpf = [name + "_lpf" for name in data_2_lpf]
+    Nans are excluded by normalised convolution. With min_footprint_coverage, product cells are kept only where at least
+    that fraction of the samples within their footprint is valid. The footprint is the filter's main lobe,
+    +- resolution_product / 2 along both dimensions, and samples beyond the domain count as missing.
+    min_footprint_coverage = 1 keeps only product cells whose whole footprint is available.
+    NOTE fs_x is the sampling along the first dimension of the variables, fs_y along the second
+    """
 
     ds = ds_cube.copy()
-    # we have to make sure that all arrays have the same dimension order prior to low-pass filtering
-    ds[data_lpf] = low_pass_filter_2D_dataset(
-        ds[data_2_lpf],
+    kwargs = dict(
         cutoff_frequency=1 / (resolution_product),
         fs_x=fs_x,
         fs_y=fs_y,
@@ -451,4 +515,174 @@ def compute_lpf_cube(
         fill_nans=True,
         crop_edges=crop_edges,
     )
+    # we have to make sure that all arrays have the same dimension order prior to low-pass filtering
+    filtered = low_pass_filter_2D_dataset(ds[data_2_lpf], **kwargs)
+
+    # normalised convolution: nans are filled with 0 before filtering, so the filtered valid-sample mask is divided out.
+    # Averages then only run over valid samples, and nans (swath edges, land) no longer pull the result towards 0.
+    # Without nans the weight is 1. Each distinct mask is filtered once
+    masks, mask_of = {}, {}
+    for name in data_2_lpf:
+        valid = np.isfinite(ds[name]).astype("float32")
+        mask_of[name] = next((key for key, mask in masks.items() if mask.equals(valid)), name)
+        masks.setdefault(mask_of[name], valid)
+    weights = low_pass_filter_2D_dataset(xr.Dataset(masks), **kwargs)
+
+    # fraction of valid samples within each cell's footprint, as a separable box average. It is nan where the box leaves the domain
+    # NOTE in float64: in float32 the rolling sums drift past many gaps, dropping fully covered cells just below the threshold
+    complete = {key: True for key in masks}
+    if min_footprint_coverage is not None:
+        half_widths = [int(np.floor(resolution_product / 2 * fs)) for fs in (fs_x, fs_y)]
+        for key, valid in masks.items():
+            coverage = valid.astype("float64")
+            for dim, half_width in zip(valid.dims, half_widths):
+                coverage = coverage.rolling({dim: 2 * half_width + 1}, center=True).mean()
+            complete[key] = coverage >= min_footprint_coverage - 1e-6
+
+    for name in data_2_lpf:
+        ds[name + "_lpf"] = (filtered[name] / weights[mask_of[name]]).where(complete[mask_of[name]])
     return ds
+
+def velocity_to_lag_phase(V, inc, Lambda, T_pp):
+    """
+    Phase of the lag product T_pp apart for a surface-projected velocity V, with the incidence angle inc in degrees.
+    The inverse of the conversion in combine_pulse_pair
+    """
+    return 2 * (2 * np.pi / Lambda) * T_pp * V * np.sin(np.radians(inc))
+
+def correct_lag_product_leakage(
+        ds,
+        Lambda,
+        T_pp,
+        var_inc = "inc_scat",
+    ):
+    """
+    Corrects the leakage in the lag products from add_L1_uncertainties (pp_*_sigma and pp_*_signal_and_sigma, rotated by the true
+    leakage per resolution cell) by rotating them by minus the estimated leakage phase, giving pp_*_sigma_net and pp_*_signal_and_sigma_net.
+
+    To be applied before low-pass filtering, so that the corrected products are summed as complex products, as by the processor.
+    The estimated leakage is V_leakage_pulse_rg - V_leakage_pulse_rg_net.
+    NOTE the correction is applied at the native ground-range sampling, as by a processor on its own samples
+
+    Input
+    -----
+    ds: xr.Dataset,
+        dataset containing "pp_re_sigma", "pp_im_sigma", "pp_re_signal_and_sigma", "pp_im_signal_and_sigma",
+        "V_leakage_pulse_rg", "V_leakage_pulse_rg_net" and var_inc (in degrees)
+    Lambda: float,
+        radar wavelength, in meters
+    T_pp: float,
+        pulse-pair separation time, in seconds
+
+    Returns
+    -------
+    ds: xr.Dataset,
+        copy of the input with the corrected lag products added
+    """
+    ds = ds.copy()
+
+    V_leakage_estimate = ds["V_leakage_pulse_rg"] - ds["V_leakage_pulse_rg_net"]
+    correction = np.exp(-1j * velocity_to_lag_phase(V_leakage_estimate, ds[var_inc], Lambda=Lambda, T_pp=T_pp))
+    for name in ["_sigma", "_signal_and_sigma"]:
+        lag_product_corrected = (ds[f"pp_re{name}"] + 1j * ds[f"pp_im{name}"]) * correction
+        ds[f"pp_re{name}_net"] = lag_product_corrected.real
+        ds[f"pp_im{name}_net"] = lag_product_corrected.imag
+
+    return ds
+
+def combine_pulse_pair(
+        ds,
+        Lambda,
+        T_pp,
+        suffix = "",
+        var_inc = "inc_scat",
+    ):
+    """
+    Converts the pulse-pair lag products into surface-projected velocities: V_pp from the lag product of add_L1_uncertainties
+    (pulse-pair noise only), V_sigma from the one rotated by the leakage (the L1 error), and V_signal_and_sigma from the one
+    rotated by the leakage and the geophysical signal (the measured velocity). V_sigma_net and V_signal_and_sigma_net follow from
+    the leakage-corrected products of correct_lag_product_leakage, if present.
+
+    To be applied after low-pass filtering: the phase is taken from the filtered lag product, so that resolved samples are
+    summed as complex products (as by a pulse-pair processor) rather than averaged as wrapped phases. Use suffix = "" for the native-resolution fields and
+    suffix = "_lpf" for the product-resolution fields.
+
+    Input
+    -----
+    ds: xr.Dataset,
+        dataset containing f"pp_re{suffix}", f"pp_im{suffix}", f"pp_re_sigma{suffix}", f"pp_im_sigma{suffix}",
+        f"pp_re_signal_and_sigma{suffix}", f"pp_im_signal_and_sigma{suffix}" and var_inc (in degrees),
+        and optionally their leakage-corrected f"pp_re_sigma_net{suffix}", f"pp_im_sigma_net{suffix}",
+        f"pp_re_signal_and_sigma_net{suffix}" and f"pp_im_signal_and_sigma_net{suffix}"
+    Lambda: float,
+        radar wavelength, in meters
+    T_pp: float,
+        pulse-pair separation time, in seconds
+    suffix: str,
+        suffix of the fields to combine, e.g. "_lpf" for the low-pass filtered fields
+
+    Returns
+    -------
+    ds: xr.Dataset,
+        copy of the input with f"V_pp{suffix}", f"V_sigma{suffix}", f"V_signal_and_sigma{suffix}" and, if available,
+        f"V_sigma_net{suffix}" and f"V_signal_and_sigma_net{suffix}" added
+    """
+    ds = ds.copy()
+
+    def lag_product_to_velocity(name):
+        phase = np.arctan2(ds[f"pp_im{name}{suffix}"], ds[f"pp_re{name}{suffix}"])
+        return phase2vel(
+            phase=phase,
+            wavenumber=2 * np.pi / Lambda,
+            T=T_pp
+        ) / np.sin(np.radians(ds[var_inc])) # surface projected
+
+    ds[f"V_pp{suffix}"] = lag_product_to_velocity("")
+    for name in ["_sigma", "_signal_and_sigma"]:
+        ds[f"V{name}{suffix}"] = lag_product_to_velocity(name)
+        if f"pp_re{name}_net{suffix}" in ds:
+            ds[f"V{name}_net{suffix}"] = lag_product_to_velocity(f"{name}_net")
+
+    return ds
+
+def multilook_nrcs_to_grid(
+        ds,
+        target,
+        var_nrcs = "nrcs_scat_speckle",
+        dim_range = "grg",
+        dim_az_slow_time = "az_slow_time",
+        dim_az = "az",
+    ):
+    """
+    Brings the speckled scatterometer NRCS from its fine range sampling onto the coarser grid of `target`,
+    e.g. to re-estimate leakage from SCA's own NRCS.
+
+    The NRCS is averaged along range over one target grid cell before interpolation, as a ground processor would
+    multi-look it, rather than point-sampling single-look speckle.
+    NOTE no averaging along azimuth, as that would blur the azimuthal NRCS gradients that cause leakage
+
+    Input
+    -----
+    ds: xr.Dataset,
+        dataset containing var_nrcs on a uniform range grid, with dimensions (dim_az_slow_time, dim_range)
+    target: xr.Dataset,
+        dataset providing the target coordinates dim_az and dim_range, e.g. the output of readers.create_dataset
+
+    Returns
+    -------
+    nrcs: xr.DataArray,
+        range-averaged NRCS on the target grid, with dimensions (dim_az, dim_range)
+    """
+    spacing_range = float(ds[dim_range].diff(dim_range).median())
+    spacing_target = float(target[dim_range].diff(dim_range).median())
+    n_avg = max(int(np.round(spacing_target / spacing_range)), 1)
+
+    nrcs = ds[var_nrcs].rolling({dim_range: n_avg}, center=True, min_periods=max(n_avg // 2, 1)).mean()
+    nrcs = nrcs.interp({dim_az_slow_time: target[dim_az].data, dim_range: target[dim_range].data})
+
+    return xr.DataArray(
+        nrcs.transpose(dim_az_slow_time, dim_range).data,
+        dims=(dim_az, dim_range),
+        coords={dim_az: target[dim_az].data, dim_range: target[dim_range].data},
+        name=var_nrcs,
+    )
