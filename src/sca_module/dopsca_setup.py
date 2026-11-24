@@ -17,7 +17,7 @@ class DopSCAConfig:
     # -- System Details
     f0: float = 5.405e9  # Carrier frequency [Hz], Hoogeboom et al. (2018)
     z0: float = 823e3    # Satellite altitude [m], 823-848 km, Fois et al. (2015)
-    v_sat_orbit: int = 7000    # Satellite velocity used for Doppler (geometric Doppler/leakage, Doppler decorrelation) [m/s]
+    v_sat_orbit: int = 7300    # Satellite velocity used for Doppler (geometric Doppler/leakage, Doppler decorrelation) [m/s]
     v_sat_ground: int = 6800   # Ground-track satellite velocity, sets the along-track pulse spacing [m/s], Hoogeboom et al. (2018)
     
     # -- Pulse Details
