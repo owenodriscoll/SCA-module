@@ -258,22 +258,13 @@ def add_L1_uncertainties(
     # ----------------------------
     # ---- Compute coherences ----
     # ----------------------------
-    # calculates average azimuthal beam standard deviation within -3 dB
-    # NOTE samples where the beam is unknown (nan, e.g. beyond the extent of the beam pattern) count as outside the -3 dB beam
-    beam = data_cube_resamp.beam
-    beam_3dB = (
-        xr.where(beam >= 10 ** (-3 / 10) * beam.max(dim=dim_az_beam), 1, np.nan)
-        * data_cube_resamp.az_angle_wrt_boresight_slant # in radians, antenna-frame angle
+    gamma_D = doppler_coherence(
+        data_cube_resamp.beam, data_cube_resamp.az_angle_wrt_boresight_slant,
+        Lambda=Lambda, v_sat_orbit=v_sat_orbit, T_pp=T_pp, dim_az_beam=dim_az_beam,
     )
-
-    # NOTE maybe this needs to be power weighted
-    sigma_az_angle = beam_3dB.std(dim=dim_az_beam).mean().values * 1
-    # print(sigma_az_angle)
-
-    wavenumber = 2 * np.pi / Lambda
-    # NOTE assumes a single represenative sigma_az_angle over the entire range extent.
-    # When simulating the full range-extent, a range-varying sigma_az_angle would likely be more suitable.
-    T_corr_Doppler = 1 / (np.sqrt(2) * wavenumber * v_sat_orbit * sigma_az_angle)
+    # equivalent decorrelation time, so that decorrelation(T_pp, T_corr_Doppler) == gamma_D
+    # NOTE this beam-only, range-averaged value is used for the uniform scene (fixed_SCR) only, otherwise the local gamma_D is used
+    T_corr_Doppler = T_pp / np.sqrt(-np.log(gamma_D))
     T_corr_surface = 3.29 * Lambda / U
 
     # -------------------------------------
@@ -305,13 +296,12 @@ def add_L1_uncertainties(
         sample_A, sample_B = u_1, gamma * u_1 + np.sqrt(1 - gamma**2) * u_2
     else:
         # expected power per resolution cell, positionally aligned with da_ones_independent_slant_range (same coarsening)
-        P = (
-            nrcs_scat.transpose(*data_cube_resamp[var_reference].dims)
-            .coarsen({dim_range: 2}, boundary="trim")
-            .mean()
-            .data
-        )
-        P = np.moveaxis(P, dim_to_pad, -1)  # range last for shifting
+        def per_resolution_cell(da):
+            """coarsened to the resolution cells, positionally aligned with da_ones_independent_slant_range, range last for shifting"""
+            da = da.transpose(*data_cube_resamp[var_reference].dims).coarsen({dim_range: 2}, boundary="trim").mean()
+            return np.moveaxis(da.data, dim_to_pad, -1)
+
+        P = per_resolution_cell(nrcs_scat)
         n = int(np.round(offset_samples / 2))
 
         def shift_range(x, k):
@@ -324,7 +314,9 @@ def add_L1_uncertainties(
             return out
 
         # each pulse carries half the power; the second pulse sees the same scatterers, decorrelated by surface and platform motion
-        gamma_speckle = speckle_coherence(T_pp=T_pp, T_corr_surface=T_corr_surface, T_corr_Doppler=T_corr_Doppler)
+        # the Doppler coherence is that of cell r, beam- and NRCS-weighted (gamma_D from compute_observations): only the echoes
+        # from r are correlated between the two samples, the clutter from r -+ offset enters through its power only
+        gamma_speckle = decorrelation(T_pp, T_corr_surface) * per_resolution_cell(data_cube_resamp["gamma_D"])
         u_echo, u_new = generate_complex_speckle((2, *P.shape), random_state=random_state)
         echo_1 = np.sqrt(P / 2) * u_echo
         echo_2 = np.sqrt(P / 2) * (gamma_speckle * u_echo + np.sqrt(1 - gamma_speckle**2) * u_new)
@@ -403,6 +395,20 @@ def add_L1_uncertainties(
             data_cube_resamp[name] = data_cube_resamp[name].where(data_cube_resamp[var_signal].notnull())
 
     return data_cube_resamp
+
+def doppler_coherence(beam, az_angle_slant, Lambda, v_sat_orbit, T_pp, dim_az_beam):
+    """
+    Pulse-pair coherence due to the Doppler spread across the azimuth beam, averaged over range.
+
+    Magnitude of the two-way-beam-weighted mean phasor of the geometric Doppler rotation over T_pp.
+    NOTE samples where the beam is unknown (nan, beyond the extent of the beam pattern) get zero gain
+    NOTE assumes a single representative value over the entire range extent
+    """
+    wavenumber = 2 * np.pi / Lambda
+    w = beam.fillna(0)
+    phasor = np.exp(1j * 2 * wavenumber * v_sat_orbit * np.sin(az_angle_slant) * T_pp)
+    return (np.abs((w * phasor).sum(dim_az_beam)) / w.sum(dim_az_beam)).mean().values
+
 
 def compute_cube_observation_geometry(ds_cube, dim_az_beam, dim_az_slow_time, dim_range, var_inc, sat_height, boresight_elevation_angle_scat):
     data_cube = ds_cube.copy()
@@ -486,6 +492,9 @@ def compute_observations(ds_cube, var_nrcs, dim_az_beam, v_sat_orbit, Lambda, T_
         azimuth_dim = dim_az_beam
     )
     data_cube["dop_geom_pulse_rg"] = np.arctan2(lag_product_geom.imag, lag_product_geom.real) / (2 * np.pi * T_pp)
+    # its magnitude is the local Doppler coherence: the spread of the geometric Doppler phases under the beam- and NRCS-weights
+    # NOTE use the noise-free NRCS for this, the coherence is a property of the scene, speckle is drawn with it
+    data_cube["gamma_D"] = np.abs(lag_product_geom)
     data_cube["V_leakage_pulse_rg"] = dop2vel(
         Doppler=data_cube["dop_geom_pulse_rg"],
         Lambda=Lambda,
