@@ -6,9 +6,41 @@ from drama.performance.sar.antenna_patterns import sinc_bp, phased_array
 from leakage.misc import calculate_distance
 from leakage.utils import mean_along_azimuth
 from leakage.low_pass_filter import low_pass_filter_2D_dataset
-from leakage.conversions import phase2vel, dop2vel, vel2dop, slant2ground
+from leakage.conversions import phase2vel, dop2vel
 from leakage.frequency_domain_padding import padding_fourier, da_integer_oversample_like, compute_padding_1D
-from leakage.uncertainties import decorrelation, pulse_pair_coherence, generate_complex_speckle, speckle_intensity, speckle_coherence
+from leakage.uncertainties import decorrelation, pulse_pair_coherence, generate_complex_speckle, speckle_intensity
+
+# spherical Earth: ground ranges are arc lengths along the surface from nadir, the platform is at EARTH_RADIUS + height
+EARTH_RADIUS = 6371e3
+
+
+def slant_range_curved(ground_range, height, along_track = 0):
+    """slant range on a spherical Earth to the point at ground_range (cross-track arc) and along_track (ground distance)"""
+    Rs, c = EARTH_RADIUS + height, ground_range / EARTH_RADIUS
+    a = along_track / (EARTH_RADIUS * np.cos(c))
+    return np.sqrt(Rs**2 + EARTH_RADIUS**2 - 2 * Rs * EARTH_RADIUS * np.cos(a) * np.cos(c))
+
+
+def slant2ground_curved(spacing_slant_range, height, ground_range_max, ground_range_min):
+    """ground ranges (arc lengths, increasing) of samples uniformly spaced in slant range, from ground_range_max downwards"""
+    Rs = EARTH_RADIUS + height
+    R = np.arange(slant_range_curved(ground_range_max, height), slant_range_curved(ground_range_min, height), -spacing_slant_range)
+    return list(EARTH_RADIUS * np.arccos((Rs**2 + EARTH_RADIUS**2 - R**2) / (2 * Rs * EARTH_RADIUS)))[::-1]
+
+
+def beam_from_flat_grid(beam, cube, height, dim_az_beam = "az_beam", dim_range = "grg"):
+    """
+    Looks up a beam pattern that is stored on a (dim_az_beam, dim_range) km grid made with the flat-Earth slant range
+    (as the EUMETSAT beam file), at the slant azimuth angles of the (curved-Earth) cube. The beam is a function of the antenna angle:
+    on the flat-Earth grid, angle phi is at az = tan(phi) * sqrt(ground_range**2 + height**2)
+    NOTE the elevation (range) dependence is still looked up by ground range
+    """
+    az_flat = np.tan(cube["az_angle_wrt_boresight_slant"]) * np.sqrt(cube[dim_range]**2 + height**2)
+    grg = cube[dim_range].broadcast_like(az_flat)
+    rename = {dim_az_beam: "_az", dim_range: "_rg"}
+    looked_up = beam.interp({dim_az_beam: az_flat.rename(rename), dim_range: grg.rename(rename)}, method="linear")
+    looked_up = looked_up.drop_vars([dim_az_beam, dim_range], errors="ignore").rename({"_az": dim_az_beam, "_rg": dim_range})
+    return looked_up.assign_coords({dim_az_beam: cube[dim_az_beam], dim_range: cube[dim_range]})
 
 
 def create_observation_cube(
@@ -195,8 +227,7 @@ def add_L1_uncertainties(
     # ---- Interpolate to slant range ----
     # ------------------------------------
     # NOTE to do this nicely the azimuth angle should also be taken into account, as it slightly affects local incidence angle
-    # NOTE slant range does not account for Earths curvature here
-    new_grg_pixel = slant2ground(
+    new_grg_pixel = slant2ground_curved(
         spacing_slant_range=grid_spacing_slant_range,
         height=sat_height,
         ground_range_max=data_cube[dim_range].max().data * 1,
@@ -379,9 +410,13 @@ def compute_cube_observation_geometry(ds_cube, dim_az_beam, dim_az_slow_time, di
         x=data_cube[dim_az_beam], y=data_cube[dim_range]
     )
 
-    data_cube["distance_slant_range"] = calculate_distance(
-            x=data_cube["distance_ground"], y=sat_height
-        )
+    # spherical Earth (see slant_range_curved)
+    data_cube["distance_slant_range"] = slant_range_curved(data_cube[dim_range], sat_height, along_track=data_cube[dim_az_beam])
+
+    # zero-Doppler incidence angle (degrees) of the SCA geometry, used for the ground projection of velocities
+    # NOTE it differs from var_inc when the input (e.g. the SWB) was simulated for another geometry
+    Rs, c = EARTH_RADIUS + sat_height, data_cube[dim_range] / EARTH_RADIUS
+    data_cube["inc_geometry"] = np.degrees(np.arcsin(Rs * np.sin(c) / slant_range_curved(data_cube[dim_range], sat_height)))
 
     # azimuth angle in the slant plane (antenna frame): sin = az / slant range
     # use for the antenna beam pattern and the beam's angular spread (Doppler decorrelation time)
@@ -392,7 +427,7 @@ def compute_cube_observation_geometry(ds_cube, dim_az_beam, dim_az_slow_time, di
         ) # NOTE arcsin instead of tan as distance_slant_range includes azimuthal angle
 
     # azimuth angle in the ground plane: sin = az / ground distance
-    # use with vel2dop, which itself projects from the ground plane onto the line of sight via sin(incidence)
+    # NOTE flat Earth, not used for the geometric Doppler (see compute_observations), kept for reference
     data_cube["az_angle_wrt_boresight_ground"] = np.arcsin(
         (data_cube[dim_az_beam]) / data_cube["distance_ground"]
         )
@@ -403,7 +438,7 @@ def compute_cube_observation_geometry(ds_cube, dim_az_beam, dim_az_slow_time, di
     
     return data_cube
 
-def compute_observations(ds_cube, var_nrcs, var_inc, dim_az_beam, v_sat_orbit, Lambda, T_pp, var_azimuth_angle_wrt_boresight: str = "az_angle_wrt_boresight_ground"):
+def compute_observations(ds_cube, var_nrcs, dim_az_beam, v_sat_orbit, Lambda, T_pp):
     """
     Integrates NRCS, Doppler and the geometric Doppler (leakage) over the azimuth beam.
     v_sat_orbit is the satellite velocity used for the geometric Doppler.
@@ -429,21 +464,15 @@ def compute_observations(ds_cube, var_nrcs, var_inc, dim_az_beam, v_sat_orbit, L
         azimuth_dim = dim_az_beam
     )
 
-    data_cube["inc_scat"] = mean_along_azimuth(
-        data_cube[var_inc],
-        azimuth_dim = dim_az_beam,
-    )
+    # incidence of the SCA geometry (compute_cube_observation_geometry), used for the ground projection of velocities
+    data_cube["inc_scat"] = data_cube["inc_geometry"].broadcast_like(data_cube[var_nrcs].isel({dim_az_beam: 0}, drop=True))
 
-    data_cube["dop_geom"] = vel2dop(
-        velocity=v_sat_orbit,
-        Lambda=Lambda,
-        angle_incidence=np.radians(data_cube[var_inc]),  # NOTE assumes flat Earth
-        # NOTE vel2dop expects the ground-plane azimuth angle; passing the slant-plane angle applies sin(incidence) twice
-        # NOTE var_inc is the zero-Doppler incidence, not the local incidence at each az_beam offset;
-        # NOTE assumes a zero Doppler centroid at boresight (no Earth-rotation or attitude residual): the geometric Doppler is zero at az_beam = 0
-        angle_azimuth=data_cube[var_azimuth_angle_wrt_boresight],
-        degrees=False,
-    )
+    # geometric Doppler from the platform geometry: the sine of the slant-plane azimuth angle (az / slant range) is the projection
+    # of the along-track velocity onto the line of sight, also on a spherical Earth (with the curved slant range).
+    # NOTE the input incidence (e.g. from the SWB) is not used here, as it can differ from the SCA geometry (altitude, Earth curvature)
+    # NOTE spherical Earth through the curved slant range (compute_cube_observation_geometry), so v_sat_orbit is the orbital velocity;
+    # assumes a zero Doppler centroid at boresight (no Earth-rotation or attitude residual)
+    data_cube["dop_geom"] = 2 / Lambda * v_sat_orbit * np.sin(data_cube["az_angle_wrt_boresight_slant"])
 
     # calculate scatterometer nrcs at scatterometer resolution (integrate over beam)
     data_cube["nrcs_scat"] = mean_along_azimuth(
